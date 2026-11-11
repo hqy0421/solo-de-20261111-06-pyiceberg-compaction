@@ -1,0 +1,52 @@
+*.swp
+.DS_Store
+.cache
+tmp/
+site
+.env
+dev/.env
+
+# intellij files
+.idea
+.idea_modules/
+*.ipr
+*.iws
+*.iml
+out
+
+# rat library install location
+lib/
+
+__pycache__/
+*.py[cod]
+.eggs/
+.tox/
+env/
+venv/
+.venv/
+*.egg-info/
+test-reports
+build/
+dist/
+sdist/
+.coverage
+coverage.xml
+.pytest_cache/
+
+# vscode/eclipse files
+.classpath
+.project
+.settings
+bin/
+.vscode/
+
+# Python stuff
+.mypy_cache/
+htmlcov
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+pyiceberg/avro/decoder_fast.c
+pyiceberg/avro/*.html
+pyiceberg/avro/*.so

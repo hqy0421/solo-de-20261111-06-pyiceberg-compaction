@@ -1,0 +1,558 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# pylint: disable=broad-except,redefined-builtin,redefined-outer-name
+import logging
+from collections.abc import Callable
+from functools import wraps
+from typing import (
+    Any,
+    Literal,
+)
+
+import click
+from click import Context
+
+from pyiceberg import __version__
+from pyiceberg.catalog import URI, Catalog, load_catalog
+from pyiceberg.cli.output import ConsoleOutput, JsonOutput, Output
+from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchPropertyException, NoSuchTableError, NoSuchViewError
+from pyiceberg.io import WAREHOUSE
+from pyiceberg.table import Table, TableProperties
+from pyiceberg.table.refs import SnapshotRef, SnapshotRefType
+from pyiceberg.typedef import Properties
+from pyiceberg.utils.properties import property_as_int
+from pyiceberg.view import View
+
+
+def catch_exception() -> Callable:  # type: ignore
+    def decorator(func: Callable) -> Callable:  # type: ignore
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any):  # type: ignore
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                ctx: Context = click.get_current_context(silent=True)
+                _, output = _catalog_and_output(ctx)
+                output.exception(e)
+                ctx.exit(1)
+
+        return wrapper
+
+    return decorator
+
+
+@click.group()
+@click.version_option(__version__, message="%(version)s")
+@click.option("--catalog")
+@click.option("--verbose", type=click.BOOL)
+@click.option("--output", type=click.Choice(["text", "json"]), default="text")
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
+    default="WARNING",
+    envvar="PYICEBERG_LOG_LEVEL",
+    help="Set the logging level",
+)
+@click.option("--ugi")
+@click.option("--uri")
+@click.option("--credential")
+@click.option("--warehouse")
+@click.pass_context
+def run(
+    ctx: Context,
+    catalog: str | None,
+    verbose: bool,
+    output: str,
+    log_level: str,
+    ugi: str | None,
+    uri: str | None,
+    credential: str | None,
+    warehouse: str | None,
+) -> None:
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format="%(asctime)s:%(levelname)s:%(name)s:%(message)s",
+    )
+
+    properties = {}
+    if ugi:
+        properties["ugi"] = ugi
+    if uri:
+        properties[URI] = uri
+    if credential:
+        properties["credential"] = credential
+    if warehouse:
+        properties[WAREHOUSE] = warehouse
+
+    ctx.ensure_object(dict)
+    if output == "text":
+        ctx.obj["output"] = ConsoleOutput(verbose=verbose)
+    else:
+        ctx.obj["output"] = JsonOutput(verbose=verbose)
+
+    if ctx.invoked_subcommand == "version":
+        return
+
+    try:
+        ctx.obj["catalog"] = load_catalog(catalog, **properties)
+    except Exception as e:
+        ctx.obj["output"].exception(e)
+        ctx.exit(1)
+
+    if not isinstance(ctx.obj["catalog"], Catalog):
+        ctx.obj["output"].exception(
+            ValueError("Could not determine catalog type from uri. REST (http/https) and Hive (thrift) is supported")
+        )
+        ctx.exit(1)
+
+
+def _catalog_and_output(ctx: Context) -> tuple[Catalog, Output]:
+    """Small helper to set the types."""
+    return ctx.obj["catalog"], ctx.obj["output"]
+
+
+@run.command()
+@click.pass_context
+@click.argument("parent", required=False)
+@catch_exception()
+def list(ctx: Context, parent: str | None) -> None:  # pylint: disable=redefined-builtin
+    """List tables or namespaces."""
+    catalog, output = _catalog_and_output(ctx)
+
+    identifiers = []
+    if parent:
+        # Do we have tables under parent namespace?
+        identifiers = catalog.list_tables(parent)
+    if not identifiers:
+        # List hierarchical namespaces if parent, root namespaces otherwise.
+        identifiers = catalog.list_namespaces(parent or ())
+    output.identifiers(identifiers)
+
+
+@run.command()
+@click.option(
+    "--entity",
+    type=click.Choice(["any", "namespace", "table", "view"]),
+    default="any",
+    help="Entity type. 'any' auto-detects and requires --entity when ambiguous.",
+)
+@click.argument("identifier")
+@click.pass_context
+@catch_exception()
+def describe(ctx: Context, entity: Literal["any", "namespace", "table", "view"], identifier: str) -> None:
+    """Describe a namespace, a table, or a view."""
+    catalog, output = _catalog_and_output(ctx)
+    identifier_tuple = Catalog.identifier_to_tuple(identifier)
+
+    if entity == "namespace":
+        output.describe_properties(catalog.load_namespace_properties(identifier_tuple))
+        return
+    if entity == "table":
+        output.describe_table(catalog.load_table(identifier))
+        return
+    if entity == "view":
+        output.describe_view(catalog.load_view(identifier))
+        return
+
+    # For the default "any" entity, auto-detect the entity type.
+    if len(identifier_tuple) == 1:
+        output.describe_properties(catalog.load_namespace_properties(identifier_tuple))
+        return
+
+    matches: tuple[str, ...] = ()
+    namespace_properties: Properties | None = None
+    catalog_table: Table | None = None
+    catalog_view: View | None = None
+
+    try:
+        namespace_properties = catalog.load_namespace_properties(identifier_tuple)
+        matches += ("namespace",)
+    except NoSuchNamespaceError:
+        pass
+
+    try:
+        catalog_table = catalog.load_table(identifier)
+        matches += ("table",)
+    except NoSuchTableError:
+        pass
+
+    try:
+        catalog_view = catalog.load_view(identifier)
+        matches += ("view",)
+    except (NoSuchViewError, NotImplementedError):
+        pass
+
+    if len(matches) > 1:
+        raise ValueError(
+            f"Identifier {identifier} matches multiple entity types: {', '.join(matches)}. Use --entity to disambiguate."
+        )
+    if not matches:
+        raise NoSuchTableError(f"Table, view, or namespace does not exist: {identifier}")
+
+    match matches[0]:
+        case "namespace":
+            assert namespace_properties is not None
+            output.describe_properties(namespace_properties)
+        case "table":
+            assert catalog_table is not None
+            output.describe_table(catalog_table)
+        case "view":
+            assert catalog_view is not None
+            output.describe_view(catalog_view)
+
+
+@run.command()
+@click.argument("identifier")
+@click.option("--history", is_flag=True)
+@click.pass_context
+@catch_exception()
+def files(ctx: Context, identifier: str, history: bool) -> None:
+    """List all the files of the table."""
+    catalog, output = _catalog_and_output(ctx)
+
+    catalog_table = catalog.load_table(identifier)
+    output.files(catalog_table, history)
+
+
+@run.command()
+@click.argument("identifier")
+@click.pass_context
+@catch_exception()
+def schema(ctx: Context, identifier: str) -> None:
+    """Get the schema of the table."""
+    catalog, output = _catalog_and_output(ctx)
+    table = catalog.load_table(identifier)
+    output.schema(table.schema())
+
+
+@run.command()
+@click.argument("identifier")
+@click.pass_context
+@catch_exception()
+def spec(ctx: Context, identifier: str) -> None:
+    """Return the partition spec of the table."""
+    catalog, output = _catalog_and_output(ctx)
+    table = catalog.load_table(identifier)
+    output.spec(table.spec())
+
+
+@run.command()
+@click.argument("identifier")
+@click.pass_context
+@catch_exception()
+def uuid(ctx: Context, identifier: str) -> None:
+    """Return the UUID of the table."""
+    catalog, output = _catalog_and_output(ctx)
+    metadata = catalog.load_table(identifier).metadata
+    output.uuid(metadata.table_uuid)
+
+
+@run.command()
+@click.argument("identifier")
+@click.pass_context
+@catch_exception()
+def location(ctx: Context, identifier: str) -> None:
+    """Return the location of the table."""
+    catalog, output = _catalog_and_output(ctx)
+    table = catalog.load_table(identifier)
+    output.text(table.location())
+
+
+@run.command()
+@click.pass_context
+@catch_exception()
+def version(ctx: Context) -> None:
+    """Print the installed pyiceberg package version. Deprecated: use --version instead."""
+    click.echo(
+        "Deprecation warning: the `version` command is deprecated and will be removed in 0.13.0. "
+        "Please use `pyiceberg --version` instead.",
+        err=True,
+    )
+    ctx.obj["output"].version(__version__)
+
+
+@run.group()
+def create() -> None:
+    """Operation to create a namespace."""
+
+
+@create.command()
+@click.argument("identifier")
+@click.pass_context
+@catch_exception()
+def namespace(ctx: Context, identifier: str) -> None:
+    """Create a namespace."""
+    catalog, output = _catalog_and_output(ctx)
+
+    catalog.create_namespace(identifier)
+    output.text(f"Created namespace: {identifier}")
+
+
+@run.group()
+def drop() -> None:
+    """Operations to drop a namespace or table."""
+
+
+@drop.command()
+@click.argument("identifier")
+@click.option("--purge", is_flag=True, help="Request that the catalog purge all table files.", default=False)
+@click.pass_context
+@catch_exception()
+def table(ctx: Context, identifier: str, purge: bool) -> None:  # noqa: F811
+    """Drop a table."""
+    catalog, output = _catalog_and_output(ctx)
+
+    if purge:
+        catalog.purge_table(identifier)
+    else:
+        catalog.drop_table(identifier)
+    purge_message = " (purge requested)" if purge else ""
+    output.text(f"Dropped table: {identifier}{purge_message}")
+
+
+@drop.command()  # type: ignore
+@click.argument("identifier")
+@click.pass_context
+@catch_exception()
+def namespace(ctx: Context, identifier: str) -> None:  # noqa: F811
+    """Drop a namespace."""
+    catalog, output = _catalog_and_output(ctx)
+
+    catalog.drop_namespace(identifier)
+    output.text(f"Dropped namespace: {identifier}")
+
+
+@drop.command()
+@click.argument("identifier")
+@click.pass_context
+@catch_exception()
+def view(ctx: Context, identifier: str) -> None:  # noqa: F811
+    """Drop a view."""
+    catalog, output = _catalog_and_output(ctx)
+
+    catalog.drop_view(identifier)
+    output.text(f"Dropped view: {identifier}")
+
+
+@run.command()
+@click.argument("from_identifier")
+@click.argument("to_identifier")
+@click.pass_context
+@catch_exception()
+def rename(ctx: Context, from_identifier: str, to_identifier: str) -> None:
+    """Rename a table."""
+    catalog, output = _catalog_and_output(ctx)
+
+    catalog.rename_table(from_identifier, to_identifier)
+    output.text(f"Renamed table from {from_identifier} to {to_identifier}")
+
+
+@run.group()
+def properties() -> None:
+    """Properties on tables/namespaces."""
+
+
+@properties.group()
+def get() -> None:
+    """Fetch properties on tables/namespaces."""
+
+
+@get.command("namespace")
+@click.argument("identifier")
+@click.argument("property_name", required=False)
+@click.pass_context
+@catch_exception()
+def get_namespace(ctx: Context, identifier: str, property_name: str) -> None:
+    """Fetch properties on a namespace."""
+    catalog, output = _catalog_and_output(ctx)
+    identifier_tuple = Catalog.identifier_to_tuple(identifier)
+
+    namespace_properties = catalog.load_namespace_properties(identifier_tuple)
+
+    if not property_name:
+        output.describe_properties(namespace_properties)
+        return
+
+    property_value = namespace_properties.get(property_name)
+    if property_value is None:
+        raise NoSuchPropertyException(f"Could not find property {property_name} on namespace {identifier}")
+
+    output.text(property_value)
+
+
+@get.command("table")
+@click.argument("identifier")
+@click.argument("property_name", required=False)
+@click.pass_context
+@catch_exception()
+def get_table(ctx: Context, identifier: str, property_name: str) -> None:
+    """Fetch properties on a table."""
+    catalog, output = _catalog_and_output(ctx)
+    identifier_tuple = Catalog.identifier_to_tuple(identifier)
+
+    metadata = catalog.load_table(identifier_tuple).metadata
+
+    if not property_name:
+        output.describe_properties(metadata.properties)
+        return
+
+    property_value = metadata.properties.get(property_name)
+    if property_value is None:
+        raise NoSuchPropertyException(f"Could not find property {property_name} on table {identifier}")
+
+    output.text(property_value)
+
+
+@properties.group()
+def set() -> None:
+    """Set a property on tables/namespaces."""
+
+
+@set.command()  # type: ignore
+@click.argument("identifier")
+@click.argument("property_name")
+@click.argument("property_value")
+@click.pass_context
+@catch_exception()
+def namespace(ctx: Context, identifier: str, property_name: str, property_value: str) -> None:  # noqa: F811
+    """Set a property on a namespace."""
+    catalog, output = _catalog_and_output(ctx)
+
+    catalog.update_namespace_properties(identifier, updates={property_name: property_value})
+    output.text(f"Updated {property_name} on {identifier}")
+
+
+@set.command()  # type: ignore
+@click.argument("identifier")
+@click.argument("property_name")
+@click.argument("property_value")
+@click.pass_context
+@catch_exception()
+def table(ctx: Context, identifier: str, property_name: str, property_value: str) -> None:  # noqa: F811
+    """Set a property on a table."""
+    catalog, output = _catalog_and_output(ctx)
+    identifier_tuple = Catalog.identifier_to_tuple(identifier)
+
+    table = catalog.load_table(identifier_tuple)
+    with table.transaction() as tx:
+        tx.set_properties({property_name: property_value})
+    output.text(f"Set {property_name}={property_value} on {identifier}")
+
+
+@properties.group()
+def remove() -> None:
+    """Remove a property from tables/namespaces."""
+
+
+@remove.command()  # type: ignore
+@click.argument("identifier")
+@click.argument("property_name")
+@click.pass_context
+@catch_exception()
+def namespace(ctx: Context, identifier: str, property_name: str) -> None:  # noqa: F811
+    """Remove a property from a namespace."""
+    catalog, output = _catalog_and_output(ctx)
+
+    result = catalog.update_namespace_properties(identifier, removals={property_name})
+
+    if result.removed == [property_name]:
+        output.text(f"Property {property_name} removed from {identifier}")
+    else:
+        raise NoSuchPropertyException(f"Property {property_name} does not exist on {identifier}")
+
+
+@remove.command()  # type: ignore
+@click.argument("identifier")
+@click.argument("property_name")
+@click.pass_context
+@catch_exception()
+def table(ctx: Context, identifier: str, property_name: str) -> None:  # noqa: F811
+    """Remove a property from a table."""
+    catalog, output = _catalog_and_output(ctx)
+    table = catalog.load_table(identifier)
+    if property_name in table.metadata.properties:
+        with table.transaction() as tx:
+            tx.remove_properties(property_name)
+        output.text(f"Property {property_name} removed from {identifier}")
+    else:
+        raise NoSuchPropertyException(f"Property {property_name} does not exist on {identifier}")
+
+
+@run.command()
+@click.argument("namespace")
+@click.pass_context
+@catch_exception()
+def list_views(ctx: Context, namespace: str) -> None:
+    """List all views in a namespace."""
+    catalog, output = _catalog_and_output(ctx)
+    identifiers = catalog.list_views(namespace)
+    output.identifiers(identifiers)
+
+
+@run.command()
+@click.argument("identifier")
+@click.option("--type", required=False)
+@click.option("--verbose", type=click.BOOL)
+@click.pass_context
+@catch_exception()
+def list_refs(ctx: Context, identifier: str, type: str, verbose: bool) -> None:
+    """List all the refs in the provided table."""
+    catalog, output = _catalog_and_output(ctx)
+    table = catalog.load_table(identifier)
+    refs = table.refs()
+    if type:
+        type = type.lower()
+        if type not in {SnapshotRefType.BRANCH, SnapshotRefType.TAG}:
+            raise ValueError(f"Type must be either branch or tag, got: {type}")
+
+    relevant_refs = [
+        (ref_name, ref.snapshot_ref_type, _retention_properties(ref, table.properties))
+        for (ref_name, ref) in refs.items()
+        if not type or ref.snapshot_ref_type == type
+    ]
+
+    output.describe_refs(relevant_refs)
+
+
+def _retention_properties(ref: SnapshotRef, table_properties: dict[str, str]) -> dict[str, str]:
+    retention_properties = {}
+    if ref.snapshot_ref_type == SnapshotRefType.BRANCH:
+        default_min_snapshots_to_keep = property_as_int(
+            table_properties,
+            TableProperties.MIN_SNAPSHOTS_TO_KEEP,
+            TableProperties.MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
+        )
+
+        default_max_snapshot_age_ms = property_as_int(
+            table_properties,
+            TableProperties.MAX_SNAPSHOT_AGE_MS,
+            TableProperties.MAX_SNAPSHOT_AGE_MS_DEFAULT,
+        )
+
+        retention_properties["min_snapshots_to_keep"] = (
+            str(ref.min_snapshots_to_keep) if ref.min_snapshots_to_keep else str(default_min_snapshots_to_keep)
+        )
+        retention_properties["max_snapshot_age_ms"] = (
+            str(ref.max_snapshot_age_ms) if ref.max_snapshot_age_ms else str(default_max_snapshot_age_ms)
+        )
+    else:
+        retention_properties["min_snapshots_to_keep"] = "N/A"
+        retention_properties["max_snapshot_age_ms"] = "N/A"
+
+    retention_properties["max_ref_age_ms"] = str(ref.max_ref_age_ms) if ref.max_ref_age_ms else "forever"
+
+    return retention_properties

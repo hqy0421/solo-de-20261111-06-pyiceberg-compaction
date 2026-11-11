@@ -1,0 +1,1326 @@
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing,
+#  software distributed under the License is distributed on an
+#  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+#  KIND, either express or implied.  See the License for the
+#  specific language governing permissions and limitations
+#  under the License.
+import datetime
+import os
+import uuid
+from pathlib import PosixPath
+from typing import Any
+from unittest import mock
+from unittest.mock import MagicMock
+
+import pytest
+from click.testing import CliRunner
+from pytest_mock import MockFixture
+
+from pyiceberg import __version__
+from pyiceberg.catalog.memory import InMemoryCatalog
+from pyiceberg.cli.console import run
+from pyiceberg.exceptions import NoSuchTableError, NoSuchViewError
+from pyiceberg.io import WAREHOUSE
+from pyiceberg.partitioning import PartitionField, PartitionSpec
+from pyiceberg.schema import Schema
+from pyiceberg.transforms import IdentityTransform
+from pyiceberg.typedef import Properties
+from pyiceberg.types import LongType, NestedField
+from pyiceberg.utils.config import Config
+from pyiceberg.view import View
+from pyiceberg.view.metadata import ViewMetadata
+
+
+def test_missing_uri(mocker: MockFixture, empty_home_dir_path: str) -> None:
+    # mock to prevent parsing ~/.pyiceberg.yaml or {PYICEBERG_HOME}/.pyiceberg.yaml
+    mocker.patch.dict(os.environ, values={"HOME": empty_home_dir_path, "PYICEBERG_HOME": empty_home_dir_path})
+    mocker.patch("pyiceberg.catalog._ENV_CONFIG", return_value=Config())
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["list"])
+
+    assert result.exit_code == 1
+    assert result.output == "Could not initialize catalog with the following properties: {}\n"
+
+
+def test_hive_catalog_missing_uri_shows_helpful_error(mocker: MockFixture) -> None:
+    mock_env_config = mocker.MagicMock()
+    mock_env_config.get_catalog_config.return_value = {"type": "hive"}
+    mocker.patch("pyiceberg.catalog._ENV_CONFIG", mock_env_config)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--catalog", "my_hive_catalog", "list"])
+
+    assert result.exit_code == 1
+    assert "URI missing, please provide using --uri" in result.output
+    assert "'uri'" not in result.output
+
+
+def test_version_does_not_load_catalog(mocker: MockFixture) -> None:
+    mock_load_catalog = mocker.patch("pyiceberg.cli.console.load_catalog", side_effect=Exception("should not be called"))
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["version"])
+
+    assert result.exit_code == 0
+    assert result.stdout == f"{__version__}\n"
+    mock_load_catalog.assert_not_called()
+
+
+def test_version_flag() -> None:
+    runner = CliRunner()
+    result = runner.invoke(run, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.output == f"{__version__}\n"
+
+
+def test_version_command_emits_deprecation_warning() -> None:
+    runner = CliRunner()
+    result = runner.invoke(run, ["version"])
+
+    assert result.exit_code == 0
+    assert result.stdout == f"{__version__}\n"
+    assert "deprecated" in result.stderr.lower()
+    assert "pyiceberg --version" in result.stderr
+
+
+@pytest.fixture(autouse=True)
+def env_vars(mocker: MockFixture) -> None:
+    mocker.patch.dict(os.environ, MOCK_ENVIRONMENT)
+
+
+@pytest.fixture(name="catalog")
+def fixture_catalog(mocker: MockFixture, tmp_path: PosixPath) -> InMemoryCatalog:
+    in_memory_catalog = InMemoryCatalog(
+        "test.in_memory.catalog", **{WAREHOUSE: tmp_path.absolute().as_posix(), "test.key": "test.value"}
+    )
+    mocker.patch("pyiceberg.cli.console.load_catalog", return_value=in_memory_catalog)
+    return in_memory_catalog
+
+
+@pytest.fixture(name="namespace_properties")
+def fixture_namespace_properties() -> Properties:
+    return TEST_NAMESPACE_PROPERTIES.copy()
+
+
+@pytest.fixture()
+def mock_datetime_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    datetime_mock = MagicMock(wraps=datetime.datetime)
+    datetime_mock.now.return_value = datetime.datetime.fromtimestamp(TEST_TIMESTAMP / 1000.0).astimezone()
+    monkeypatch.setattr(datetime, "datetime", datetime_mock)
+
+
+TEST_TABLE_IDENTIFIER = ("default", "my_table")
+TEST_TABLE_NAMESPACE = "default"
+TEST_NAMESPACE_PROPERTIES = {"location": "s3://warehouse/database/location"}
+TEST_TABLE_NAME = "my_table"
+TEST_TABLE_SCHEMA = Schema(
+    NestedField(1, "x", LongType(), required=True),
+    NestedField(2, "y", LongType(), doc="comment", required=True),
+    NestedField(3, "z", LongType(), required=True),
+)
+TEST_TABLE_PARTITION_SPEC = PartitionSpec(PartitionField(name="x", transform=IdentityTransform(), source_id=1, field_id=1000))
+TEST_TABLE_PROPERTIES = {"read.split.target.size": "134217728", "write.parquet.bloom-filter-enabled.column.x": True}
+TEST_TABLE_UUID = uuid.UUID("d20125c8-7284-442c-9aea-15fee620737c")
+TEST_TIMESTAMP = 1602638573874
+MOCK_ENVIRONMENT = {"PYICEBERG_CATALOG__PRODUCTION__URI": "test://doesnotexist"}
+
+
+def test_list_root(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["list"])
+
+    assert result.exit_code == 0
+    assert TEST_TABLE_NAMESPACE in result.output
+
+
+def test_list_namespace(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["list", "default"])
+
+    assert result.exit_code == 0
+    assert result.output == "default.my_table\n"
+
+
+@pytest.mark.parametrize("entity_args", [[], ["--entity", "namespace"]], ids=["any", "namespace"])
+def test_describe_namespace(catalog: InMemoryCatalog, namespace_properties: Properties, entity_args: list[str]) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["describe", *entity_args, "default"])
+
+    assert result.exit_code == 0
+    assert result.output == "location  s3://warehouse/database/location\n"
+
+
+def test_describe_namespace_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["describe", "doesnotexist"])
+
+    assert result.exit_code == 1
+    assert result.output == "Namespace doesnotexist does not exists\n"
+
+
+@pytest.fixture()
+def test_describe_table(catalog: InMemoryCatalog, mock_datetime_now: None) -> None:
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["describe", "default.my_table"])
+    assert result.exit_code == 0
+    assert (
+        # Strip the whitespace on the end
+        "\n".join([line.rstrip() for line in result.output.split("\n")])
+        == """Table format version  2
+Metadata location     s3://warehouse/default/my_table/metadata/metadata.json
+Table UUID            d20125c8-7284-442c-9aea-15fee620737c
+Last Updated          1602638573874
+Partition spec        [
+                        1000: x: identity(1)
+                      ]
+Sort order            []
+Current schema        Schema, id=0
+                      ├── 1: x: required long
+                      ├── 2: y: required long (comment)
+                      └── 3: z: required long
+Current snapshot      None
+Snapshots             Snapshots
+                      └── Snapshot 1925, schema None
+Properties
+"""
+    )
+
+
+def test_describe_table_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["describe", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Table, view, or namespace does not exist: default.doesnotexist\n"
+
+
+@pytest.mark.parametrize("entity_args", [[], ["--entity", "table"]], ids=["any", "table"])
+def test_describe_table_entity_detection(catalog: InMemoryCatalog, mock_datetime_now: None, entity_args: list[str]) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["describe", *entity_args, "default.my_table"])
+
+    assert result.exit_code == 0
+    assert "Table UUID" in result.output
+    assert "Current schema" in result.output
+
+
+def test_describe_ambiguous_entity(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(identifier=TEST_TABLE_IDENTIFIER, schema=TEST_TABLE_SCHEMA)
+    catalog.create_namespace(TEST_TABLE_IDENTIFIER, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["describe", "default.my_table"])
+    assert result.exit_code == 1
+    assert " ".join(result.output.split()) == (
+        "Identifier default.my_table matches multiple entity types: namespace, table. Use --entity to disambiguate."
+    )
+
+
+def test_schema(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["schema", "default.my_table"])
+    assert result.exit_code == 0
+    assert (
+        "\n".join([line.rstrip() for line in result.output.split("\n")])
+        == """x  long
+y  long  comment
+z  long
+"""
+    )
+
+
+def test_schema_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["schema", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Table does not exist: default.doesnotexist\n"
+
+
+def test_spec(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["spec", "default.my_table"])
+    assert result.exit_code == 0
+    assert (
+        result.output
+        == """[
+  1000: x: identity(1)
+]
+"""
+    )
+
+
+def test_spec_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["spec", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Table does not exist: default.doesnotexist\n"
+
+
+@mock.patch("uuid.uuid4", return_value=TEST_TABLE_UUID)
+def test_uuid(uuid_mock: None, catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["uuid", "default.my_table"])
+    assert result.exit_code == 0
+    assert result.output == """d20125c8-7284-442c-9aea-15fee620737c\n"""
+
+
+def test_uuid_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["uuid", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Table does not exist: default.doesnotexist\n"
+
+
+def test_location(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+    runner = CliRunner()
+    result = runner.invoke(run, ["location", "default.my_table"])
+    assert result.exit_code == 0
+    assert result.output == f"""{catalog._warehouse_location}/default/my_table\n"""
+
+
+def test_location_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["location", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Table does not exist: default.doesnotexist\n"
+
+
+def test_drop_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["drop", "table", "default.my_table"])
+    assert result.exit_code == 0
+    assert result.output == """Dropped table: default.my_table\n"""
+
+
+def test_drop_table_with_purge(catalog: InMemoryCatalog, mocker: MockFixture) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+    purge_table = mocker.spy(catalog, "purge_table")
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["drop", "table", "default.my_table", "--purge"])
+    assert result.exit_code == 0
+    assert result.output == """Dropped table: default.my_table (purge requested)\n"""
+    purge_table.assert_called_once_with("default.my_table")
+
+
+def test_drop_table_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["drop", "table", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Table does not exist: default.doesnotexist\n"
+
+
+def test_drop_namespace(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["drop", "namespace", "default"])
+    assert result.exit_code == 0
+    assert result.output == """Dropped namespace: default\n"""
+
+
+def test_drop_namespace_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["drop", "namespace", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Namespace does not exist: doesnotexist\n"
+
+
+def test_create_namespace(catalog: InMemoryCatalog) -> None:
+    runner = CliRunner()
+    result = runner.invoke(run, ["create", "namespace", TEST_TABLE_NAMESPACE])
+    assert result.exit_code == 0
+    assert result.output == """Created namespace: default\n"""
+
+
+def test_create_namespace_already_exists(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["create", "namespace", TEST_TABLE_NAMESPACE])
+    assert result.exit_code == 1
+    assert result.output == "Namespace default already exists\n"
+
+
+def test_rename_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["rename", "default.my_table", "default.my_new_table"])
+    assert result.exit_code == 0
+    assert result.output == """Renamed table from default.my_table to default.my_new_table\n"""
+
+
+def test_rename_table_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    catalog.create_namespace("default")
+    runner = CliRunner()
+    result = runner.invoke(run, ["rename", "default.doesnotexist", "default.bar"])
+    assert result.exit_code == 1
+    assert result.output == "Table does not exist: doesnotexist\n"
+
+
+def test_properties_get_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "table", "default.my_table"])
+    assert result.exit_code == 0
+    assert (
+        result.output
+        == "read.split.target.size                       134217728\nwrite.parquet.bloom-filter-enabled.column.x  true     \n"
+    )
+
+
+def test_properties_get_table_specific_property(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "table", "default.my_table", "read.split.target.size"])
+    assert result.exit_code == 0
+    assert result.output == "134217728\n"
+
+
+def test_properties_get_table_specific_empty_property(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties={"empty": ""},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "table", "default.my_table", "empty"])
+    assert result.exit_code == 0
+    assert result.output == "\n"
+
+
+def test_properties_get_table_specific_property_that_doesnt_exist(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "table", "default.my_table", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Could not find property doesnotexist on table default.my_table\n"
+
+
+def test_properties_get_table_does_not_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "table", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Empty namespace identifier\n"
+
+
+def test_properties_get_namespace(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "namespace", "default"])
+    assert result.exit_code == 0
+    assert result.output == "location  s3://warehouse/database/location\n"
+
+
+def test_properties_get_namespace_specific_property(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "namespace", "default", "location"])
+    assert result.exit_code == 0
+    assert result.output == "s3://warehouse/database/location\n"
+
+
+def test_properties_get_namespace_specific_empty_property(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, {"empty": ""})
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "namespace", "default", "empty"])
+    assert result.exit_code == 0
+    assert result.output == "\n"
+
+
+def test_properties_get_namespace_specific_property_that_doesnt_exist(
+    catalog: InMemoryCatalog, namespace_properties: Properties
+) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "namespace", "default", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Could not find property doesnotexist on namespace default\n"
+
+
+def test_properties_get_namespace_does_not_exist(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "namespace", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Namespace doesnotexist does not exists\n"
+
+
+def test_properties_set_namespace(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "set", "namespace", "default", "location", "s3://new_location"])
+    assert result.exit_code == 0
+    assert result.output == "Updated location on default\n"
+
+
+def test_properties_set_namespace_that_doesnt_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "set", "namespace", "doesnotexist", "location", "s3://new_location"])
+    assert result.exit_code == 1
+    assert result.output == "Namespace doesnotexist does not exists\n"
+
+
+def test_properties_set_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "set", "table", "default.my_table", "location", "s3://new_location"])
+    assert result.exit_code == 0
+    assert result.output == "Set location=s3://new_location on default.my_table\n"
+
+
+def test_properties_set_table_does_not_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "set", "table", "default.doesnotexist", "location", "s3://new_location"])
+    assert result.exit_code == 1
+    assert result.output == "Table does not exist: default.doesnotexist\n"
+
+
+def test_properties_remove_namespace(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "remove", "namespace", "default", "location"])
+    assert result.exit_code == 0
+    assert result.output == "Property location removed from default\n"
+
+
+def test_properties_remove_namespace_that_doesnt_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "remove", "namespace", "doesnotexist", "location"])
+    assert result.exit_code == 1
+    assert result.output == "Namespace doesnotexist does not exists\n"
+
+
+def test_properties_remove_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "remove", "table", "default.my_table", "read.split.target.size"])
+    assert result.exit_code == 0
+    assert result.output == "Property read.split.target.size removed from default.my_table\n"
+
+
+def test_properties_remove_table_property_does_not_exists(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "remove", "table", "default.my_table", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Property doesnotexist does not exist on default.my_table\n"
+
+
+def test_properties_remove_table_does_not_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "remove", "table", "default.doesnotexist", "location"])
+    assert result.exit_code == 1
+    assert result.output == "Table does not exist: default.doesnotexist\n"
+
+
+def test_json_list_root(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "list"])
+    assert result.exit_code == 0
+    assert result.output == """["default"]\n"""
+
+
+def test_json_list_namespace(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "list", "default"])
+    assert result.exit_code == 0
+    assert result.output == """["default.my_table"]\n"""
+
+
+def test_json_describe_namespace(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "describe", "default"])
+    assert result.exit_code == 0
+    assert result.output == """{"location": "s3://warehouse/database/location"}\n"""
+
+
+def test_json_describe_namespace_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "describe", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchNamespaceError", "message": "Namespace doesnotexist does not exists"}\n"""
+
+
+@pytest.fixture()
+def test_json_describe_table(catalog: InMemoryCatalog, mock_datetime_now: None) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "describe", "default.my_table"])
+    assert result.exit_code == 0
+    assert (
+        result.output
+        == """{"identifier":["default","my_table"],"metadata_location":"s3://warehouse/default/my_table/metadata/metadata.json","metadata":{"location":"s3://bucket/test/location","table-uuid":"d20125c8-7284-442c-9aea-15fee620737c","last-updated-ms":1602638573874,"last-column-id":3,"schemas":[{"type":"struct","fields":[{"id":1,"name":"x","type":"long","required":true},{"id":2,"name":"y","type":"long","required":true,"doc":"comment"},{"id":3,"name":"z","type":"long","required":true}],"schema-id":0,"identifier-field-ids":[]}],"current-schema-id":0,"partition-specs":[{"spec-id":0,"fields":[{"source-id":1,"field-id":1000,"transform":"identity","name":"x"}]}],"default-spec-id":0,"last-partition-id":1000,"properties":{},"snapshots":[{"snapshot-id":1925,"timestamp-ms":1602638573822}],"snapshot-log":[],"metadata-log":[],"sort-orders":[{"order-id":0,"fields":[]}],"default-sort-order-id":0,"refs":{},"format-version":2,"schema":{"type":"struct","fields":[{"id":1,"name":"x","type":"long","required":true},{"id":2,"name":"y","type":"long","required":true,"doc":"comment"},{"id":3,"name":"z","type":"long","required":true}],"schema-id":0,"identifier-field-ids":[]},"partition-spec":[{"source-id":1,"field-id":1000,"transform":"identity","name":"x"}]}}\n"""
+    )
+
+
+def test_json_describe_table_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "describe", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert (
+        result.output
+        == """{"type": "NoSuchTableError", "message": "Table, view, or namespace does not exist: default.doesnotexist"}\n"""
+    )
+
+
+def test_json_schema(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "schema", "default.my_table"])
+    assert result.exit_code == 0
+    assert result.output == (
+        '{"type":"struct","fields":[{"id":1,"name":"x","type":"long","required":true},'
+        '{"id":2,"name":"y","type":"long","required":true,"doc":"comment"},'
+        '{"id":3,"name":"z","type":"long","required":true}],"schema-id":0,"identifier-field-ids":[]}\n'
+    )
+
+
+def test_json_schema_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "schema", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: default.doesnotexist"}\n"""
+
+
+def test_json_spec(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "spec", "default.my_table"])
+    assert result.exit_code == 0
+    assert result.output == """{"spec-id":0,"fields":[{"source-id":1,"field-id":1000,"transform":"identity","name":"x"}]}\n"""
+
+
+def test_json_spec_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "spec", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: default.doesnotexist"}\n"""
+
+
+@mock.patch("uuid.uuid4", return_value=TEST_TABLE_UUID)
+def test_json_uuid(uuid_mock: None, catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "uuid", "default.my_table"])
+    assert result.exit_code == 0
+    assert result.output == """{"uuid": "d20125c8-7284-442c-9aea-15fee620737c"}\n"""
+
+
+def test_json_uuid_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "uuid", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: default.doesnotexist"}\n"""
+
+
+def test_json_location(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "location", "default.my_table"])
+    assert result.exit_code == 0
+    assert result.output == f'"{catalog._warehouse_location}/default/my_table"\n'
+
+
+def test_json_location_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "location", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: default.doesnotexist"}\n"""
+
+
+def test_json_drop_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "drop", "table", "default.my_table"])
+    assert result.exit_code == 0
+    assert result.output == """"Dropped table: default.my_table"\n"""
+
+
+def test_json_drop_table_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "drop", "table", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: default.doesnotexist"}\n"""
+
+
+def test_json_drop_namespace(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "drop", "namespace", "default"])
+    assert result.exit_code == 0
+    assert result.output == """"Dropped namespace: default"\n"""
+
+
+def test_json_drop_namespace_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "drop", "namespace", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchNamespaceError", "message": "Namespace does not exist: doesnotexist"}\n"""
+
+
+def test_json_rename_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "rename", "default.my_table", "default.my_new_table"])
+    assert result.exit_code == 0
+    assert result.output == """"Renamed table from default.my_table to default.my_new_table"\n"""
+
+
+def test_json_rename_table_does_not_exists(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    catalog.create_namespace("default")
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "rename", "default.doesnotexist", "default.bar"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: doesnotexist"}\n"""
+
+
+def test_json_properties_get_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "get", "table", "default.my_table"])
+    assert result.exit_code == 0
+    assert result.output == """{"read.split.target.size": "134217728", "write.parquet.bloom-filter-enabled.column.x": "true"}\n"""
+
+
+def test_json_properties_get_table_specific_property(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "get", "table", "default.my_table", "read.split.target.size"])
+    assert result.exit_code == 0
+    assert result.output == """"134217728"\n"""
+
+
+def test_json_properties_get_table_specific_property_that_doesnt_exist(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "get", "table", "default.my_table", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == (
+        '{"type": "NoSuchPropertyException", "message": "Could not find property doesnotexist on table default.my_table"}\n'
+    )
+
+
+def test_json_properties_get_table_does_not_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "get", "table", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: default.doesnotexist"}\n"""
+
+
+def test_json_properties_get_namespace(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "get", "namespace", "default"])
+    assert result.exit_code == 0
+    assert result.output == """{"location": "s3://warehouse/database/location"}\n"""
+
+
+def test_json_properties_get_namespace_specific_property(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "get", "namespace", "default", "location"])
+    assert result.exit_code == 0
+    assert result.output == """"s3://warehouse/database/location"\n"""
+
+
+def test_json_properties_get_namespace_does_not_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "get", "namespace", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchNamespaceError", "message": "Namespace doesnotexist does not exists"}\n"""
+
+
+def test_json_properties_set_namespace(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "set", "namespace", "default", "location", "s3://new_location"])
+    assert result.exit_code == 0
+    assert result.output == """"Updated location on default"\n"""
+
+
+def test_json_properties_set_namespace_that_doesnt_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(
+        run, ["--output=json", "properties", "set", "namespace", "doesnotexist", "location", "s3://new_location"]
+    )
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchNamespaceError", "message": "Namespace doesnotexist does not exists"}\n"""
+
+
+def test_json_properties_set_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        run, ["--output=json", "properties", "set", "table", "default.my_table", "location", "s3://new_location"]
+    )
+    assert result.exit_code == 0
+    assert result.output == """"Set location=s3://new_location on default.my_table"\n"""
+
+
+def test_json_properties_set_table_does_not_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(
+        run, ["--output=json", "properties", "set", "table", "default.doesnotexist", "location", "s3://new_location"]
+    )
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: default.doesnotexist"}\n"""
+
+
+def test_json_properties_remove_namespace(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "remove", "namespace", "default", "location"])
+    assert result.exit_code == 0
+    assert result.output == """"Property location removed from default"\n"""
+
+
+def test_json_properties_remove_namespace_that_doesnt_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "remove", "namespace", "doesnotexist", "location"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchNamespaceError", "message": "Namespace doesnotexist does not exists"}\n"""
+
+
+def test_json_properties_remove_table(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "remove", "table", "default.my_table", "read.split.target.size"])
+    assert result.exit_code == 0
+    assert result.output == """"Property read.split.target.size removed from default.my_table"\n"""
+
+
+def test_json_properties_remove_table_property_does_not_exists(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties=TEST_TABLE_PROPERTIES,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "remove", "table", "default.my_table", "doesnotexist"])
+    assert result.exit_code == 1
+    assert (
+        result.output
+        == """{"type": "NoSuchPropertyException", "message": "Property doesnotexist does not exist on default.my_table"}\n"""
+    )
+
+
+def test_json_properties_remove_table_does_not_exist(catalog: InMemoryCatalog) -> None:
+    # pylint: disable=unused-argument
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "properties", "remove", "table", "default.doesnotexist", "location"])
+    assert result.exit_code == 1
+    assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: default.doesnotexist"}\n"""
+
+
+def test_log_level_cli_option(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+
+    runner = CliRunner()
+    runner.invoke(run, ["--log-level", "DEBUG", "list"])
+
+    # Verify logging.basicConfig was called with DEBUG level
+    import logging
+
+    mock_basicConfig.assert_called_once()
+    call_kwargs = mock_basicConfig.call_args[1]
+    assert call_kwargs["level"] == logging.DEBUG
+
+
+def test_log_level_env_variable(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+    mocker.patch.dict(os.environ, {"PYICEBERG_LOG_LEVEL": "INFO"})
+
+    runner = CliRunner()
+    runner.invoke(run, ["list"])
+
+    # Verify logging.basicConfig was called with INFO level
+    import logging
+
+    mock_basicConfig.assert_called_once()
+    call_kwargs = mock_basicConfig.call_args[1]
+    assert call_kwargs["level"] == logging.INFO
+
+
+def test_log_level_default_warning(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+    # Ensure PYICEBERG_LOG_LEVEL is not set
+    mocker.patch.dict(os.environ, {}, clear=False)
+    if "PYICEBERG_LOG_LEVEL" in os.environ:
+        del os.environ["PYICEBERG_LOG_LEVEL"]
+
+    runner = CliRunner()
+    runner.invoke(run, ["list"])
+
+    # Verify logging.basicConfig was called with WARNING level (default)
+    import logging
+
+    mock_basicConfig.assert_called_once()
+    call_kwargs = mock_basicConfig.call_args[1]
+    assert call_kwargs["level"] == logging.WARNING
+
+
+def test_log_level_cli_overrides_env(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+    mocker.patch.dict(os.environ, {"PYICEBERG_LOG_LEVEL": "INFO"})
+
+    runner = CliRunner()
+    runner.invoke(run, ["--log-level", "ERROR", "list"])
+
+    # Verify CLI option overrides environment variable
+    import logging
+
+    mock_basicConfig.assert_called_once()
+    call_kwargs = mock_basicConfig.call_args[1]
+    assert call_kwargs["level"] == logging.ERROR
+
+
+def test_warehouse_cli_option_forwarded_to_catalog(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+    mock_catalog = MagicMock(spec=InMemoryCatalog)
+    mock_catalog.list_tables.return_value = []
+    mock_catalog.list_namespaces.return_value = []
+    mock_load_catalog = mocker.patch("pyiceberg.cli.console.load_catalog", return_value=mock_catalog)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        run, ["--catalog", "rest", "--uri", "https://catalog.service", "--warehouse", "example-warehouse", "list"]
+    )
+
+    assert result.exit_code == 0
+    mock_basicConfig.assert_called_once()
+    mock_load_catalog.assert_called_once_with("rest", uri="https://catalog.service", warehouse="example-warehouse")
+
+
+TEST_VIEW_IDENTIFIER = ("default", "my_view")
+TEST_VIEW_METADATA: dict[str, Any] = {
+    "view-uuid": "b30125c8-7284-442c-9aea-15fee620737c",
+    "format-version": 1,
+    "location": "s3://warehouse/default/my_view",
+    "current-version-id": 1,
+    "versions": [
+        {
+            "version-id": 1,
+            "timestamp-ms": 1602638573874,
+            "schema-id": 1,
+            "summary": {},
+            "representations": [{"type": "sql", "sql": "SELECT * FROM my_table", "dialect": "spark"}],
+            "default-namespace": ["default"],
+        }
+    ],
+    "schemas": [
+        {
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {"id": 1, "name": "x", "required": True, "type": "long"},
+            ],
+        }
+    ],
+    "version-log": [{"timestamp-ms": 1602638573874, "version-id": 1}],
+    "properties": {},
+}
+
+
+@pytest.fixture(name="catalog_with_view")
+def fixture_catalog_with_view(mocker: MockFixture, catalog: InMemoryCatalog) -> tuple[InMemoryCatalog, View]:
+    view = View(
+        TEST_VIEW_IDENTIFIER,
+        ViewMetadata.model_validate(TEST_VIEW_METADATA),
+        metadata_location="s3://warehouse/default/my_view/metadata/metadata.json",
+    )
+    catalog.list_views = MagicMock(return_value=[TEST_VIEW_IDENTIFIER])  # type: ignore
+    catalog.load_view = MagicMock(return_value=view)  # type: ignore
+    catalog.drop_view = MagicMock()  # type: ignore
+    return catalog, view
+
+
+def test_list_views(catalog_with_view: tuple[InMemoryCatalog, View]) -> None:
+    catalog, _ = catalog_with_view
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["list-views", "default"])
+    assert result.exit_code == 0
+    assert "default.my_view" in result.output
+
+
+def test_list_views_does_not_exist(catalog: InMemoryCatalog) -> None:
+    catalog.list_views = MagicMock(side_effect=NoSuchViewError("Namespace does not exist: doesnotexist"))  # type: ignore
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["list-views", "doesnotexist"])
+    assert result.exit_code == 1
+    assert "Namespace does not exist: doesnotexist" in result.output
+
+
+def test_describe_view(catalog_with_view: tuple[InMemoryCatalog, View]) -> None:
+    runner = CliRunner()
+    result = runner.invoke(run, ["describe", "--entity=view", "default.my_view"])
+    assert result.exit_code == 0
+    assert (
+        "\n".join([line.rstrip() for line in result.output.split("\n")])
+        == """View format version  1
+Metadata location    s3://warehouse/default/my_view/metadata/metadata.json
+View UUID            b30125c8-7284-442c-9aea-15fee620737c
+Location             s3://warehouse/default/my_view
+Current version      1
+Current schema       Schema, id=1
+                     └── 1: x: required long
+SQL                  SQL representations
+                     └── spark: SELECT * FROM my_table
+Properties
+"""
+    )
+
+
+def test_describe_view_does_not_exist(catalog: InMemoryCatalog) -> None:
+    catalog.load_view = MagicMock(side_effect=NoSuchViewError("View does not exist: default.doesnotexist"))  # type: ignore
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["describe", "--entity=view", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert "View does not exist: default.doesnotexist" in result.output
+
+
+def test_describe_any_falls_through_to_view(catalog_with_view: tuple[InMemoryCatalog, View]) -> None:
+    catalog, _ = catalog_with_view
+    catalog.load_table = MagicMock(side_effect=NoSuchTableError("Table does not exist: default.my_view"))  # type: ignore
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["describe", "default.my_view"])
+    assert result.exit_code == 0
+    assert "b30125c8-7284-442c-9aea-15fee620737c" in result.output
+
+
+def test_drop_view(catalog_with_view: tuple[InMemoryCatalog, View]) -> None:
+    catalog, _ = catalog_with_view
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["drop", "view", "default.my_view"])
+    assert result.exit_code == 0
+    assert result.output == "Dropped view: default.my_view\n"
+    catalog.drop_view.assert_called_once_with("default.my_view")  # type: ignore
+
+
+def test_drop_view_does_not_exist(catalog: InMemoryCatalog) -> None:
+    catalog.drop_view = MagicMock(side_effect=NoSuchViewError("View does not exist: default.doesnotexist"))  # type: ignore
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["drop", "view", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert "View does not exist: default.doesnotexist" in result.output
+
+
+def test_json_list_views(catalog_with_view: tuple[InMemoryCatalog, View]) -> None:
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "list-views", "default"])
+    assert result.exit_code == 0
+    assert result.output == '["default.my_view"]\n'
+
+
+def test_json_describe_view(catalog_with_view: tuple[InMemoryCatalog, View]) -> None:
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "describe", "--entity=view", "default.my_view"])
+    assert result.exit_code == 0
+    assert "b30125c8-7284-442c-9aea-15fee620737c" in result.output
+
+
+def test_json_drop_view(catalog_with_view: tuple[InMemoryCatalog, View]) -> None:
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "drop", "view", "default.my_view"])
+    assert result.exit_code == 0
+    assert result.output == '"Dropped view: default.my_view"\n'
+
+
+def test_json_drop_view_does_not_exist(catalog: InMemoryCatalog) -> None:
+    catalog.drop_view = MagicMock(side_effect=NoSuchViewError("View does not exist: default.doesnotexist"))  # type: ignore
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--output=json", "drop", "view", "default.doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == '{"type": "NoSuchViewError", "message": "View does not exist: default.doesnotexist"}\n'

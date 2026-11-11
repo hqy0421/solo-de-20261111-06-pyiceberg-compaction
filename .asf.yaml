@@ -1,0 +1,124 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# The format of this file is documented at
+# https://cwiki.apache.org/confluence/display/INFRA/Git+-+.asf.yaml+features
+
+github:
+  description: "PyIceberg"
+  homepage: https://py.iceberg.apache.org/
+  labels:
+    - iceberg
+    - apache
+    - hacktoberfest
+    - pyiceberg
+  enabled_merge_buttons:
+    merge: false
+    squash: true
+    squash_commit_message: PR_TITLE_AND_COMMIT_DETAILS
+    rebase: true
+  # Disabled: GitHub blocks ruleset bypass while classic protection exists.
+  # The "Default Branch Protection" ruleset replaces it.
+  protected_branches: ~
+  rulesets:
+    - name: "Default Branch Protection"
+      type: branch
+      branches:
+        includes:
+          - "~DEFAULT_BRANCH"
+        excludes: []
+      bypass_teams:
+        - root
+      restrict_deletion: true
+      restrict_force_push: true
+      required_linear_history: true
+      required_pull_request_reviews:
+        required_approving_review_count: 1
+    - name: Merge Queue
+      target: branch
+      enforcement: active
+      bypass_actors:
+        # apache/root (ASF Infra).
+        - actor_id: 118420
+          actor_type: Team
+          bypass_mode: always
+        # apache/iceberg-public. Iceberg committers can opt into this team via
+        # https://gitbox.apache.org/boxer/.
+        - actor_id: 20107235
+          actor_type: Team
+          bypass_mode: pull_request
+      conditions:
+        ref_name:
+          include:
+            - "~DEFAULT_BRANCH"
+          exclude: []
+      rules:
+        - type: required_status_checks
+          parameters:
+            # Merge Queue already tests each entry against the latest main
+            strict_required_status_checks_policy: false
+            required_status_checks:
+              # Repository policy and security checks.
+              - context: Analyze Actions
+              - context: Run zizmor 🌈
+              - context: asf-allowlist-check
+              - context: rat
+
+              # Documentation checks.
+              - context: docs
+              - context: markdown-link-check
+
+              # Python workflow gates.
+              - context: python-ci-required
+              - context: python-integration-required
+        - type: merge_queue
+          parameters:
+            check_response_timeout_minutes: 180
+            grouping_strategy: ALLGREEN
+            max_entries_to_build: 2
+            max_entries_to_merge: 1
+            merge_method: SQUASH
+            min_entries_to_merge: 1
+            min_entries_to_merge_wait_minutes: 0
+  pull_requests:
+    # allow pull requests to merge automatically once all requirements are met
+    allow_auto_merge: true
+    # auto-delete head branches after being merged
+    del_branch_on_merge: true
+  features:
+    wiki: true
+    issues: true
+    projects: true
+  collaborators:  # Note: the number of collaborators is limited to 10
+    - ajantha-bhat
+    - ndrluis
+    - rambleraptor
+  ghp_branch: gh-pages
+  ghp_path: /
+  copilot_code_review:
+    enabled: true
+    review_drafts: false
+    review_on_push: false
+
+notifications:
+    commits:      commits@iceberg.apache.org
+    issues:       issues@iceberg.apache.org
+    pullrequests: issues@iceberg.apache.org
+    jobs:         ci-jobs@iceberg.apache.org
+    jira_options: link label link label

@@ -1,0 +1,242 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import pytest
+
+from pyiceberg.manifest import DataFile, DataFileContent, FileFormat, ManifestEntry, ManifestEntryStatus
+from pyiceberg.table.delete_file_index import PATH_FIELD_ID, DeleteFileIndex, PositionDeletes
+from pyiceberg.typedef import Record
+
+
+def _create_data_file(file_path: str = "s3://bucket/data.parquet", spec_id: int = 0) -> DataFile:
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=file_path,
+        file_format=FileFormat.PARQUET,
+        partition=Record(),
+        record_count=100,
+        file_size_in_bytes=1000,
+    )
+    data_file._spec_id = spec_id
+    return data_file
+
+
+def _create_positional_delete(
+    sequence_number: int = 1, file_path: str = "s3://bucket/data.parquet", spec_id: int = 0
+) -> ManifestEntry:
+    delete_file = DataFile.from_args(
+        content=DataFileContent.POSITION_DELETES,
+        file_path=f"s3://bucket/pos-delete-{sequence_number}.parquet",
+        file_format=FileFormat.PARQUET,
+        partition=Record(),
+        record_count=10,
+        file_size_in_bytes=100,
+        lower_bounds={PATH_FIELD_ID: file_path.encode()},
+        upper_bounds={PATH_FIELD_ID: file_path.encode()},
+    )
+    delete_file._spec_id = spec_id
+    return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
+
+
+def _create_partition_delete(sequence_number: int = 1, spec_id: int = 0, partition: Record | None = None) -> ManifestEntry:
+    delete_file = DataFile.from_args(
+        content=DataFileContent.POSITION_DELETES,
+        file_path=f"s3://bucket/pos-delete-{sequence_number}.parquet",
+        file_format=FileFormat.PARQUET,
+        partition=partition or Record(),
+        record_count=10,
+        file_size_in_bytes=100,
+    )
+    delete_file._spec_id = spec_id
+    return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
+
+
+def _create_deletion_vector(
+    sequence_number: int = 1,
+    file_path: str = "s3://bucket/data.parquet",
+    spec_id: int = 0,
+    delete_file_path: str | None = None,
+    content_offset: int | None = None,
+    content_size_in_bytes: int | None = None,
+) -> ManifestEntry:
+    delete_file = DataFile.from_args(
+        _table_format_version=3,
+        content=DataFileContent.POSITION_DELETES,
+        file_path=delete_file_path or f"s3://bucket/deletion-vector-{sequence_number}.puffin",
+        file_format=FileFormat.PUFFIN,
+        partition=Record(),
+        record_count=10,
+        file_size_in_bytes=100,
+        referenced_data_file=file_path,
+        content_offset=content_offset,
+        content_size_in_bytes=content_size_in_bytes,
+    )
+    delete_file._spec_id = spec_id
+    return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
+
+
+def test_empty_index() -> None:
+    index = DeleteFileIndex()
+    data_file = _create_data_file()
+    assert index.for_data_file(1, data_file) == set()
+
+
+def test_sequence_number_filtering() -> None:
+    index = DeleteFileIndex()
+
+    index.add_delete_file(_create_positional_delete(sequence_number=2))
+    index.add_delete_file(_create_positional_delete(sequence_number=4))
+    index.add_delete_file(_create_positional_delete(sequence_number=6))
+
+    data_file = _create_data_file()
+
+    assert len(index.for_data_file(1, data_file)) == 3
+    assert len(index.for_data_file(2, data_file)) == 3
+    assert len(index.for_data_file(3, data_file)) == 2
+    assert len(index.for_data_file(5, data_file)) == 1
+    assert len(index.for_data_file(7, data_file)) == 0
+
+
+def test_path_specific_deletes() -> None:
+    index = DeleteFileIndex()
+
+    index.add_delete_file(_create_positional_delete(sequence_number=2, file_path="s3://bucket/a.parquet"))
+    index.add_delete_file(_create_positional_delete(sequence_number=2, file_path="s3://bucket/b.parquet"))
+
+    file_a = _create_data_file(file_path="s3://bucket/a.parquet")
+    file_b = _create_data_file(file_path="s3://bucket/b.parquet")
+    file_c = _create_data_file(file_path="s3://bucket/c.parquet")
+
+    assert len(index.for_data_file(1, file_a)) == 1
+    assert len(index.for_data_file(1, file_b)) == 1
+    assert len(index.for_data_file(1, file_c)) == 0
+
+
+def test_partitioned_deletes() -> None:
+    index = DeleteFileIndex()
+
+    partition_1 = Record(1)
+    partition_2 = Record(2)
+
+    index.add_delete_file(_create_partition_delete(sequence_number=2, spec_id=0, partition=partition_1), partition_1)
+    index.add_delete_file(_create_partition_delete(sequence_number=2, spec_id=0, partition=partition_2), partition_2)
+
+    data_file = _create_data_file()
+
+    assert len(index.for_data_file(1, data_file, partition_1)) == 1
+    assert len(index.for_data_file(1, data_file, partition_2)) == 1
+    assert len(index.for_data_file(1, data_file, Record(3))) == 0
+
+
+def test_mix_path_and_partition_deletes() -> None:
+    index = DeleteFileIndex()
+
+    partition = Record(1)
+
+    index.add_delete_file(_create_positional_delete(sequence_number=2, file_path="s3://bucket/a.parquet"))
+    index.add_delete_file(_create_partition_delete(sequence_number=3, spec_id=0, partition=partition), partition)
+
+    data_file = _create_data_file(file_path="s3://bucket/a.parquet")
+
+    result = index.for_data_file(1, data_file, partition)
+    assert len(result) == 2
+
+
+def test_dvs_treated_as_position_deletes() -> None:
+    index = DeleteFileIndex()
+
+    index.add_delete_file(_create_positional_delete(sequence_number=2, file_path="s3://bucket/a.parquet"))
+    index.add_delete_file(_create_deletion_vector(sequence_number=3, file_path="s3://bucket/a.parquet"))
+
+    data_file = _create_data_file(file_path="s3://bucket/a.parquet")
+
+    result = index.for_data_file(1, data_file)
+    assert len(result) == 2
+    assert all(d.content == DataFileContent.POSITION_DELETES for d in result)
+
+
+def test_dvs_with_same_file_path_are_matched_by_referenced_data_file() -> None:
+    index = DeleteFileIndex()
+    shared_file_path = "s3://bucket/deletion-vectors.bin"
+
+    index.add_delete_file(
+        _create_deletion_vector(
+            sequence_number=2,
+            file_path="s3://bucket/a.parquet",
+            delete_file_path=shared_file_path,
+            content_offset=4,
+            content_size_in_bytes=10,
+        )
+    )
+    index.add_delete_file(
+        _create_deletion_vector(
+            sequence_number=3,
+            file_path="s3://bucket/b.parquet",
+            delete_file_path=shared_file_path,
+            content_offset=40,
+            content_size_in_bytes=12,
+        )
+    )
+
+    first_deletes = index.for_data_file(1, _create_data_file("s3://bucket/a.parquet"))
+    second_deletes = index.for_data_file(1, _create_data_file("s3://bucket/b.parquet"))
+    assert len(first_deletes) == len(second_deletes) == 1
+    assert {dv.referenced_data_file for dv in first_deletes} == {"s3://bucket/a.parquet"}
+    assert {dv.referenced_data_file for dv in second_deletes} == {"s3://bucket/b.parquet"}
+    assert not index.for_data_file(1, _create_data_file("s3://bucket/unrelated.parquet"))
+    assert isinstance(first_deletes, set)
+    result = [*first_deletes, *second_deletes]
+
+    assert len(result) == 2
+    assert {(dv.file_path, dv.content_offset, dv.content_size_in_bytes) for dv in result} == {
+        (shared_file_path, 4, 10),
+        (shared_file_path, 40, 12),
+    }
+
+
+def test_cannot_add_after_indexing() -> None:
+    group = PositionDeletes()
+    group.add(_create_positional_delete(sequence_number=1).data_file, 1)
+
+    group.filter_by_seq(0)
+
+    with pytest.raises(ValueError, match="Cannot add files after indexing"):
+        group.add(_create_positional_delete(sequence_number=2).data_file, 2)
+
+
+def test_record_equality_for_partition_lookup() -> None:
+    index = DeleteFileIndex()
+
+    partition_a = Record(1, "foo")
+    partition_b = Record(1, "foo")
+    partition_c = Record(1, "bar")
+
+    assert partition_a == partition_b
+    assert partition_a != partition_c
+
+    index.add_delete_file(_create_partition_delete(sequence_number=2, spec_id=0, partition=partition_a), partition_a)
+
+    data_file = _create_data_file()
+
+    assert len(index.for_data_file(1, data_file, partition_b)) == 1
+    assert len(index.for_data_file(1, data_file, partition_c)) == 0
+
+
+def test_record_equality_for_nan_partition_lookup() -> None:
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_partition_delete(sequence_number=2, partition=Record(float("nan"))), Record(float("nan")))
+
+    assert len(index.for_data_file(1, _create_data_file(), Record(float("nan")))) == 1

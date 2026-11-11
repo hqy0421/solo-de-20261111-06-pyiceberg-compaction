@@ -1,0 +1,911 @@
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing,
+#  software distributed under the License is distributed on an
+#  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+#  KIND, either express or implied.  See the License for the
+#  specific language governing permissions and limitations
+#  under the License.
+import getpass
+import logging
+import socket
+import time
+from types import TracebackType
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Union,
+)
+from urllib.parse import urlparse
+
+from hive_metastore.ThriftHiveMetastore import Client
+from hive_metastore.ttypes import (
+    AlreadyExistsException,
+    CheckLockRequest,
+    DataOperationType,
+    EnvironmentContext,
+    FieldSchema,
+    GetTableRequest,
+    GetTablesRequest,
+    InvalidOperationException,
+    LockComponent,
+    LockLevel,
+    LockRequest,
+    LockResponse,
+    LockState,
+    LockType,
+    MetaException,
+    NoSuchObjectException,
+    SerDeInfo,
+    StorageDescriptor,
+    UnlockRequest,
+)
+from hive_metastore.ttypes import Database as HiveDatabase
+from hive_metastore.ttypes import Table as HiveTable
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from thrift.protocol import TBinaryProtocol
+from thrift.transport import TSocket, TTransport
+from typing_extensions import override
+
+from pyiceberg.catalog import (
+    EXTERNAL_TABLE,
+    ICEBERG,
+    LOCATION,
+    METADATA_LOCATION,
+    TABLE_TYPE,
+    URI,
+    MetastoreCatalog,
+    PropertiesUpdateSummary,
+)
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    NamespaceAlreadyExistsError,
+    NamespaceNotEmptyError,
+    NoSuchIcebergTableError,
+    NoSuchNamespaceError,
+    NoSuchPropertyException,
+    NoSuchTableError,
+    TableAlreadyExistsError,
+    WaitingForLockException,
+)
+from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionSpec
+from pyiceberg.schema import Schema, SchemaVisitor, visit
+from pyiceberg.serializers import FromInputFile
+from pyiceberg.table import (
+    CommitTableResponse,
+    StagedTable,
+    Table,
+    TableProperties,
+)
+from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
+from pyiceberg.table.update import (
+    TableRequirement,
+    TableUpdate,
+)
+from pyiceberg.typedef import EMPTY_DICT, Identifier, Properties
+from pyiceberg.types import (
+    BinaryType,
+    BooleanType,
+    DateType,
+    DecimalType,
+    DoubleType,
+    FixedType,
+    FloatType,
+    IntegerType,
+    ListType,
+    LongType,
+    MapType,
+    NestedField,
+    PrimitiveType,
+    StringType,
+    StructType,
+    TimestampType,
+    TimestamptzType,
+    TimeType,
+    UnknownType,
+    UUIDType,
+)
+from pyiceberg.utils.properties import property_as_bool, property_as_float
+from pyiceberg.view import View
+from pyiceberg.view.metadata import ViewVersion
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+
+COMMENT = "comment"
+OWNER = "owner"
+
+# If set to true, HiveCatalog will operate in Hive2 compatibility mode
+HIVE2_COMPATIBLE = "hive.hive2-compatible"
+HIVE2_COMPATIBLE_DEFAULT = False
+
+HIVE_KERBEROS_AUTH = "hive.kerberos-authentication"
+HIVE_KERBEROS_AUTH_DEFAULT = False
+HIVE_KERBEROS_SERVICE_NAME = "hive.kerberos-service-name"
+HIVE_KERBEROS_SERVICE_NAME_DEFAULT = "hive"
+HIVE_KERBEROS_SERVICE_HOST = "hive.kerberos-service-host"
+
+LOCK_CHECK_MIN_WAIT_TIME = "lock-check-min-wait-time"
+LOCK_CHECK_MAX_WAIT_TIME = "lock-check-max-wait-time"
+LOCK_CHECK_RETRIES = "lock-check-retries"
+DEFAULT_LOCK_CHECK_MIN_WAIT_TIME = 0.1  # 100 milliseconds
+DEFAULT_LOCK_CHECK_MAX_WAIT_TIME = 60  # 1 min
+DEFAULT_LOCK_CHECK_RETRIES = 4
+DO_NOT_UPDATE_STATS = "DO_NOT_UPDATE_STATS"
+DO_NOT_UPDATE_STATS_DEFAULT = "true"
+
+logger = logging.getLogger(__name__)
+
+
+class _HiveClient:
+    """Helper class to nicely open and close the transport."""
+
+    _transport: TTransport
+    _ugi: list[str] | None
+    _was_opened: bool
+
+    def __init__(
+        self,
+        uri: str,
+        ugi: str | None = None,
+        kerberos_auth: bool | None = HIVE_KERBEROS_AUTH_DEFAULT,
+        kerberos_service_name: str | None = HIVE_KERBEROS_SERVICE_NAME,
+        kerberos_service_host: str | None = None,
+    ):
+        self._uri = uri
+        self._kerberos_auth = kerberos_auth
+        self._kerberos_service_name = kerberos_service_name
+        self._kerberos_service_host = kerberos_service_host or urlparse(uri).hostname
+        self._ugi = ugi.split(":") if ugi else None
+        self._transport = self._init_thrift_transport()
+        self._was_opened = False
+
+    def _init_thrift_transport(self) -> TTransport:
+        url_parts = urlparse(self._uri)
+        socket = TSocket.TSocket(url_parts.hostname, url_parts.port)
+        if not self._kerberos_auth:
+            return TTransport.TBufferedTransport(socket)
+        else:
+            return TTransport.TSaslClientTransport(socket, host=self._kerberos_service_host, service=self._kerberos_service_name)
+
+    def _client(self) -> Client:
+        protocol = TBinaryProtocol.TBinaryProtocol(self._transport)
+        client = Client(protocol)
+        if self._ugi:
+            client.set_ugi(*self._ugi)
+        return client
+
+    def __enter__(self) -> Client:
+        """Make sure the transport is initialized and open."""
+        if self._was_opened:
+            self._transport = self._init_thrift_transport()
+        self._transport.open()
+        self._was_opened = True
+        return self._client()
+
+    def __exit__(self, exctype: type[BaseException] | None, excinst: BaseException | None, exctb: TracebackType | None) -> None:
+        """Close transport if it was opened."""
+        if self._transport.isOpen():
+            self._transport.close()
+
+
+def _construct_hive_storage_descriptor(schema: Schema, location: str | None, hive2_compatible: bool = False) -> StorageDescriptor:
+    ser_de_info = SerDeInfo(serializationLib="org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe")
+    return StorageDescriptor(
+        [
+            FieldSchema(field.name, visit(field.field_type, SchemaToHiveConverter(hive2_compatible)), field.doc)
+            for field in schema.fields
+        ],
+        location,
+        "org.apache.hadoop.mapred.FileInputFormat",
+        "org.apache.hadoop.mapred.FileOutputFormat",
+        serdeInfo=ser_de_info,
+    )
+
+
+PROP_EXTERNAL = "EXTERNAL"
+PROP_TABLE_TYPE = "table_type"
+PROP_METADATA_LOCATION = "metadata_location"
+PROP_PREVIOUS_METADATA_LOCATION = "previous_metadata_location"
+DEFAULT_PROPERTIES = {TableProperties.PARQUET_COMPRESSION: TableProperties.PARQUET_COMPRESSION_DEFAULT}
+
+
+def _construct_parameters(
+    metadata_location: str, previous_metadata_location: str | None = None, metadata_properties: Properties | None = None
+) -> dict[str, Any]:
+    properties = {PROP_EXTERNAL: "TRUE", PROP_TABLE_TYPE: "ICEBERG", PROP_METADATA_LOCATION: metadata_location}
+    if previous_metadata_location:
+        properties[PROP_PREVIOUS_METADATA_LOCATION] = previous_metadata_location
+
+    if metadata_properties:
+        for key, value in metadata_properties.items():
+            if key not in properties:
+                properties[key] = str(value)
+
+    return properties
+
+
+def _annotate_namespace(database: HiveDatabase, properties: Properties) -> HiveDatabase:
+    params = {}
+    for key, value in properties.items():
+        if key == COMMENT:
+            database.description = value
+        elif key == LOCATION:
+            database.locationUri = value
+        else:
+            params[key] = value
+    database.parameters = params
+    return database
+
+
+HIVE_PRIMITIVE_TYPES = {
+    BooleanType: "boolean",
+    IntegerType: "int",
+    LongType: "bigint",
+    FloatType: "float",
+    DoubleType: "double",
+    DateType: "date",
+    TimeType: "string",
+    TimestampType: "timestamp",
+    TimestamptzType: "timestamp with local time zone",
+    StringType: "string",
+    UUIDType: "string",
+    BinaryType: "binary",
+    FixedType: "binary",
+    UnknownType: "void",
+}
+
+
+class SchemaToHiveConverter(SchemaVisitor[str]):
+    hive2_compatible: bool
+
+    def __init__(self, hive2_compatible: bool):
+        self.hive2_compatible = hive2_compatible
+
+    def schema(self, schema: Schema, struct_result: str) -> str:
+        return struct_result
+
+    def struct(self, struct: StructType, field_results: list[str]) -> str:
+        return f"struct<{','.join(field_results)}>"
+
+    def field(self, field: NestedField, field_result: str) -> str:
+        return f"{field.name}:{field_result}"
+
+    def list(self, list_type: ListType, element_result: str) -> str:
+        return f"array<{element_result}>"
+
+    def map(self, map_type: MapType, key_result: str, value_result: str) -> str:
+        # Key has to be primitive for Hive
+        return f"map<{key_result},{value_result}>"
+
+    def primitive(self, primitive: PrimitiveType) -> str:
+        if isinstance(primitive, DecimalType):
+            return f"decimal({primitive.precision},{primitive.scale})"
+        elif self.hive2_compatible and isinstance(primitive, TimestamptzType):
+            # Hive2 doesn't support timestamp with local time zone
+            return "timestamp"
+        else:
+            return HIVE_PRIMITIVE_TYPES[type(primitive)]
+
+
+class HiveCatalog(MetastoreCatalog):
+    _client: _HiveClient
+
+    def __init__(self, name: str, **properties: str):
+        super().__init__(name, **properties)
+        self._client = self._create_hive_client(properties)
+        self._hive2_compatible = property_as_bool(properties, HIVE2_COMPATIBLE, HIVE2_COMPATIBLE_DEFAULT)
+
+        self._lock_check_min_wait_time = property_as_float(properties, LOCK_CHECK_MIN_WAIT_TIME, DEFAULT_LOCK_CHECK_MIN_WAIT_TIME)
+        self._lock_check_max_wait_time = property_as_float(properties, LOCK_CHECK_MAX_WAIT_TIME, DEFAULT_LOCK_CHECK_MAX_WAIT_TIME)
+        self._lock_check_retries = property_as_float(
+            properties,
+            LOCK_CHECK_RETRIES,
+            DEFAULT_LOCK_CHECK_RETRIES,
+        )
+
+    @staticmethod
+    def _create_hive_client(properties: dict[str, str]) -> _HiveClient:
+        last_exception = None
+        for uri in properties[URI].split(","):
+            try:
+                return _HiveClient(
+                    uri,
+                    properties.get("ugi"),
+                    property_as_bool(properties, HIVE_KERBEROS_AUTH, HIVE_KERBEROS_AUTH_DEFAULT),
+                    properties.get(HIVE_KERBEROS_SERVICE_NAME, HIVE_KERBEROS_SERVICE_NAME_DEFAULT),
+                    properties.get(HIVE_KERBEROS_SERVICE_HOST),
+                )
+            except BaseException as e:
+                last_exception = e
+        if last_exception is not None:
+            raise last_exception
+        else:
+            raise ValueError(f"Unable to connect to hive using uri: {properties[URI]}")
+
+    def _convert_hive_into_iceberg(self, table: HiveTable) -> Table:
+        properties: dict[str, str] = table.parameters
+        if TABLE_TYPE not in properties:
+            raise NoSuchPropertyException(
+                f"Property table_type missing, could not determine type: {table.dbName}.{table.tableName}"
+            )
+
+        table_type = properties[TABLE_TYPE]
+        if table_type.lower() != ICEBERG:
+            raise NoSuchIcebergTableError(
+                f"Property table_type is {table_type}, expected {ICEBERG}: {table.dbName}.{table.tableName}"
+            )
+
+        if prop_metadata_location := properties.get(METADATA_LOCATION):
+            metadata_location = prop_metadata_location
+        else:
+            raise NoSuchPropertyException(f"Table property {METADATA_LOCATION} is missing")
+
+        io = self._load_file_io(location=metadata_location)
+        file = io.new_input(metadata_location)
+        metadata = FromInputFile.table_metadata(file)
+        return Table(
+            identifier=(table.dbName, table.tableName),
+            metadata=metadata,
+            metadata_location=metadata_location,
+            io=self._load_file_io(location=metadata_location, table_properties=metadata.properties),
+            catalog=self,
+        )
+
+    def _convert_iceberg_into_hive(self, table: Table) -> HiveTable:
+        identifier_tuple = table.name()
+        database_name, table_name = self.identifier_to_database_and_table(identifier_tuple, NoSuchTableError)
+        current_time_millis = int(time.time() * 1000)
+
+        return HiveTable(
+            dbName=database_name,
+            tableName=table_name,
+            owner=table.properties[OWNER] if table.properties and OWNER in table.properties else getpass.getuser(),
+            createTime=current_time_millis // 1000,
+            lastAccessTime=current_time_millis // 1000,
+            sd=_construct_hive_storage_descriptor(
+                table.schema(),
+                table.location(),
+                self._hive2_compatible,
+            ),
+            tableType=EXTERNAL_TABLE,
+            parameters=_construct_parameters(metadata_location=table.metadata_location, metadata_properties=table.properties),
+        )
+
+    def _create_hive_table(self, open_client: Client, hive_table: HiveTable) -> None:
+        try:
+            open_client.create_table(hive_table)
+        except AlreadyExistsException as e:
+            raise TableAlreadyExistsError(f"Table {hive_table.dbName}.{hive_table.tableName} already exists") from e
+
+    def _fetch_hive_table(self, open_client: Client, database_name: str, table_name: str) -> HiveTable:
+        # Hive 4.0.1 removed get_table, and Hive 2.2 and older do not have get_table_req
+        if self._hive2_compatible:
+            return open_client.get_table(dbname=database_name, tbl_name=table_name)
+        return open_client.get_table_req(GetTableRequest(dbName=database_name, tblName=table_name)).table
+
+    def _fetch_hive_tables(self, open_client: Client, database_name: str) -> list[HiveTable]:
+        table_names = open_client.get_all_tables(db_name=database_name)
+        if self._hive2_compatible:
+            return open_client.get_table_objects_by_name(dbname=database_name, tbl_names=table_names)
+        return open_client.get_table_objects_by_name_req(GetTablesRequest(dbName=database_name, tblNames=table_names)).tables
+
+    def _get_hive_table(self, open_client: Client, database_name: str, table_name: str) -> HiveTable:
+        try:
+            return self._fetch_hive_table(open_client, database_name, table_name)
+        except NoSuchObjectException as e:
+            raise NoSuchTableError(f"Table does not exists: {table_name}") from e
+
+    @override
+    def create_table(
+        self,
+        identifier: str | Identifier,
+        schema: Union[Schema, "pa.Schema"],
+        location: str | None = None,
+        partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+        sort_order: SortOrder = UNSORTED_SORT_ORDER,
+        properties: Properties = EMPTY_DICT,
+    ) -> Table:
+        """Create a table.
+
+        Args:
+            identifier: Table identifier.
+            schema: Table's schema.
+            location: Location for the table. Optional Argument.
+            partition_spec: PartitionSpec for the table.
+            sort_order: SortOrder for the table.
+            properties: Table properties that can be a string based dictionary.
+
+        Returns:
+            Table: the created table instance.
+
+        Raises:
+            AlreadyExistsError: If a table with the name already exists.
+            ValueError: If the identifier is invalid.
+        """
+        properties = {**DEFAULT_PROPERTIES, **properties}
+        staged_table = self._create_staged_table(
+            identifier=identifier,
+            schema=schema,
+            location=location,
+            partition_spec=partition_spec,
+            sort_order=sort_order,
+            properties=properties,
+        )
+        database_name, table_name = self.identifier_to_database_and_table(identifier)
+
+        self._write_metadata(staged_table.metadata, staged_table.io, staged_table.metadata_location)
+        tbl = self._convert_iceberg_into_hive(staged_table)
+
+        with self._client as open_client:
+            self._create_hive_table(open_client, tbl)
+            hive_table = self._fetch_hive_table(open_client, database_name, table_name)
+
+        return self._convert_hive_into_iceberg(hive_table)
+
+    @override
+    def create_view(
+        self,
+        identifier: str | Identifier,
+        schema: Union[Schema, "pa.Schema"],
+        view_version: ViewVersion,
+        location: str | None = None,
+        properties: Properties = EMPTY_DICT,
+    ) -> View:
+        raise NotImplementedError
+
+    @override
+    def register_table(self, identifier: str | Identifier, metadata_location: str, overwrite: bool = False) -> Table:
+        """Register a new table using existing metadata.
+
+        Args:
+            identifier (Union[str, Identifier]): Table identifier for the table
+            metadata_location (str): The location to the metadata
+            overwrite (bool): Whether to overwrite the existing table, default False
+
+        Returns:
+            Table: The newly registered table
+
+        Raises:
+            TableAlreadyExistsError: If the table already exists
+        """
+        if overwrite:
+            raise NotImplementedError("`overwrite` isn't supported")
+
+        database_name, table_name = self.identifier_to_database_and_table(identifier)
+        io = self._load_file_io(location=metadata_location)
+        metadata_file = io.new_input(metadata_location)
+        staged_table = StagedTable(
+            identifier=(database_name, table_name),
+            metadata=FromInputFile.table_metadata(metadata_file),
+            metadata_location=metadata_location,
+            io=io,
+            catalog=self,
+        )
+        tbl = self._convert_iceberg_into_hive(staged_table)
+        with self._client as open_client:
+            self._create_hive_table(open_client, tbl)
+            hive_table = self._fetch_hive_table(open_client, database_name, table_name)
+
+        return self._convert_hive_into_iceberg(hive_table)
+
+    @override
+    def list_views(self, namespace: str | Identifier) -> list[Identifier]:
+        raise NotImplementedError
+
+    @override
+    def view_exists(self, identifier: str | Identifier) -> bool:
+        raise NotImplementedError
+
+    @override
+    def load_view(self, identifier: str | Identifier) -> View:
+        raise NotImplementedError
+
+    @override
+    def rename_view(self, from_identifier: str | Identifier, to_identifier: str | Identifier) -> None:
+        raise NotImplementedError
+
+    def _create_lock_request(self, database_name: str, table_name: str) -> LockRequest:
+        # Iceberg commits are not executed within a Hive transaction, so the lock component uses operationType=NO_TXN.
+        # Setting it explicitly also matters for Hive 2.1.0, which rejects a lock component left at the default UNSET
+        # operation type. Hive 2.1.1 relaxed this validation:
+        # https://github.com/apache/hive/blob/rel/release-2.1.1/metastore/src/java/org/apache/hadoop/hive/metastore/txn/TxnHandler.java#L939-L947
+        # operation type.
+        lock_component: LockComponent = LockComponent(
+            level=LockLevel.TABLE,
+            type=LockType.EXCLUSIVE,
+            dbname=database_name,
+            tablename=table_name,
+            operationType=DataOperationType.NO_TXN,
+            isTransactional=True,
+        )
+
+        lock_request: LockRequest = LockRequest(component=[lock_component], user=getpass.getuser(), hostname=socket.gethostname())
+
+        return lock_request
+
+    def _wait_for_lock(self, database_name: str, table_name: str, lockid: int, open_client: Client) -> LockResponse:
+        @retry(
+            retry=retry_if_exception_type(WaitingForLockException),
+            wait=wait_exponential(multiplier=2, min=self._lock_check_min_wait_time, max=self._lock_check_max_wait_time),
+            stop=stop_after_attempt(self._lock_check_retries),
+            reraise=True,
+        )
+        def _do_wait_for_lock() -> LockResponse:
+            response: LockResponse = open_client.check_lock(CheckLockRequest(lockid=lockid))
+            if response.state == LockState.ACQUIRED:
+                return response
+            elif response.state == LockState.WAITING:
+                msg = f"Wait on lock for {database_name}.{table_name}"
+                logger.warning(msg)
+                raise WaitingForLockException(msg)
+            else:
+                raise CommitFailedException(f"Failed to check lock for {database_name}.{table_name}, state: {response.state}")
+
+        return _do_wait_for_lock()
+
+    @override
+    def commit_table(
+        self, table: Table, requirements: tuple[TableRequirement, ...], updates: tuple[TableUpdate, ...]
+    ) -> CommitTableResponse:
+        """Commit updates to a table.
+
+        Args:
+            table (Table): The table to be updated.
+            requirements: (Tuple[TableRequirement, ...]): Table requirements.
+            updates: (Tuple[TableUpdate, ...]): Table updates.
+
+        Returns:
+            CommitTableResponse: The updated metadata.
+
+        Raises:
+            NoSuchTableError: If a table with the given identifier does not exist.
+            CommitFailedException: Requirement not met, or a conflict with a concurrent commit.
+        """
+        table_identifier = table.name()
+        database_name, table_name = self.identifier_to_database_and_table(table_identifier, NoSuchTableError)
+        # commit to hive
+        # https://github.com/apache/hive/blob/master/standalone-metastore/metastore-common/src/main/thrift/hive_metastore.thrift#L1232
+        with self._client as open_client:
+            lock: LockResponse = open_client.lock(self._create_lock_request(database_name, table_name))
+
+            try:
+                if lock.state != LockState.ACQUIRED:
+                    if lock.state == LockState.WAITING:
+                        self._wait_for_lock(database_name, table_name, lock.lockid, open_client)
+                    else:
+                        raise CommitFailedException(f"Failed to acquire lock for {table_identifier}, state: {lock.state}")
+
+                hive_table: HiveTable | None
+                current_table: Table | None
+                try:
+                    hive_table = self._get_hive_table(open_client, database_name, table_name)
+                    current_table = self._convert_hive_into_iceberg(hive_table)
+                except NoSuchTableError:
+                    hive_table = None
+                    current_table = None
+
+                updated_staged_table = self._update_and_stage_table(current_table, table_identifier, requirements, updates)
+                if current_table and updated_staged_table.metadata == current_table.metadata:
+                    # no changes, do nothing
+                    return CommitTableResponse(metadata=current_table.metadata, metadata_location=current_table.metadata_location)
+                self._write_metadata(
+                    metadata=updated_staged_table.metadata,
+                    io=updated_staged_table.io,
+                    metadata_path=updated_staged_table.metadata_location,
+                )
+
+                if hive_table and current_table:
+                    # Table exists, update it.
+
+                    # Note on table properties:
+                    # - Iceberg table properties are stored in both HMS and Iceberg metadata JSON.
+                    # - Updates are reflected in both locations
+                    # - Existing HMS table properties (set by external systems like Hive/Spark) are preserved.
+                    #
+                    # While it is possible to modify HMS table properties through this API, it is not recommended:
+                    # - Mixing HMS-specific properties in Iceberg metadata can cause confusion
+                    # - New/updated HMS table properties will also be stored in Iceberg metadata (even though it is HMS-specific)
+                    # - HMS-native properties (set outside Iceberg) cannot be deleted since they are not visible to Iceberg
+                    #   (However, if you first SET an HMS property via Iceberg, it becomes tracked in Iceberg metadata,
+                    #   and can then be deleted via Iceberg - which removes it from both Iceberg metadata and HMS)
+                    new_iceberg_properties = _construct_parameters(
+                        metadata_location=updated_staged_table.metadata_location,
+                        previous_metadata_location=current_table.metadata_location,
+                        metadata_properties=updated_staged_table.properties,
+                    )
+                    # Detect properties that were removed from Iceberg metadata
+                    deleted_iceberg_properties = current_table.properties.keys() - updated_staged_table.properties.keys()
+
+                    # Merge: preserve HMS-native properties, remove deleted Iceberg properties, apply new Iceberg properties
+                    existing_hms_parameters = dict(hive_table.parameters or {})
+                    for key in deleted_iceberg_properties:
+                        existing_hms_parameters.pop(key, None)
+                    existing_hms_parameters.update(new_iceberg_properties)
+                    hive_table.parameters = existing_hms_parameters
+
+                    # Update hive's schema and properties
+                    hive_table.sd = _construct_hive_storage_descriptor(
+                        updated_staged_table.schema(),
+                        updated_staged_table.location(),
+                        self._hive2_compatible,
+                    )
+                    open_client.alter_table_with_environment_context(
+                        dbname=database_name,
+                        tbl_name=table_name,
+                        new_tbl=hive_table,
+                        environment_context=EnvironmentContext(properties={DO_NOT_UPDATE_STATS: DO_NOT_UPDATE_STATS_DEFAULT}),
+                    )
+                else:
+                    # Table does not exist, create it.
+                    hive_table = self._convert_iceberg_into_hive(
+                        StagedTable(
+                            identifier=(database_name, table_name),
+                            metadata=updated_staged_table.metadata,
+                            metadata_location=updated_staged_table.metadata_location,
+                            io=updated_staged_table.io,
+                            catalog=self,
+                        )
+                    )
+                    self._create_hive_table(open_client, hive_table)
+            except WaitingForLockException as e:
+                raise CommitFailedException(f"Failed to acquire lock for {table_identifier}, state: {lock.state}") from e
+            finally:
+                open_client.unlock(UnlockRequest(lockid=lock.lockid))
+
+        return CommitTableResponse(
+            metadata=updated_staged_table.metadata, metadata_location=updated_staged_table.metadata_location
+        )
+
+    @override
+    def load_table(self, identifier: str | Identifier) -> Table:
+        """Load the table's metadata and return the table instance.
+
+        You can also use this method to check for table existence using 'try catalog.table() except TableNotFoundError'.
+        Note: This method doesn't scan data stored in the table.
+
+        Args:
+            identifier: Table identifier.
+
+        Returns:
+            Table: the table instance with its metadata.
+
+        Raises:
+            NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+        """
+        database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+
+        with self._client as open_client:
+            hive_table = self._get_hive_table(open_client, database_name, table_name)
+
+        return self._convert_hive_into_iceberg(hive_table)
+
+    @override
+    def drop_table(self, identifier: str | Identifier) -> None:
+        """Drop a table.
+
+        Args:
+            identifier: Table identifier.
+
+        Raises:
+            NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+        """
+        database_name, table_name = self.identifier_to_database_and_table(identifier, NoSuchTableError)
+        try:
+            with self._client as open_client:
+                open_client.drop_table(dbname=database_name, name=table_name, deleteData=False)
+        except NoSuchObjectException as e:
+            # When the namespace doesn't exist, it throws the same error
+            raise NoSuchTableError(f"Table does not exists: {table_name}") from e
+
+    @override
+    def purge_table(self, identifier: str | Identifier) -> None:
+        # This requires to traverse the reachability set, and drop all the data files.
+        raise NotImplementedError("Not yet implemented")
+
+    @override
+    def rename_table(self, from_identifier: str | Identifier, to_identifier: str | Identifier) -> Table:
+        """Rename a fully classified table name.
+
+        Args:
+            from_identifier: Existing table identifier.
+            to_identifier: New table identifier.
+
+        Returns:
+            Table: the updated table instance with its metadata.
+
+        Raises:
+            ValueError: When from table identifier is invalid.
+            NoSuchTableError: When a table with the name does not exist.
+            NoSuchNamespaceError: When the destination namespace doesn't exist.
+            TableAlreadyExistsError: When the destination table already exists.
+        """
+        from_database_name, from_table_name = self.identifier_to_database_and_table(from_identifier, NoSuchTableError)
+        to_database_name, to_table_name = self.identifier_to_database_and_table(to_identifier)
+
+        if self.table_exists(to_identifier):
+            raise TableAlreadyExistsError(f"Table already exists: {to_table_name}")
+
+        try:
+            with self._client as open_client:
+                tbl = self._fetch_hive_table(open_client, from_database_name, from_table_name)
+                tbl.dbName = to_database_name
+                tbl.tableName = to_table_name
+                open_client.alter_table_with_environment_context(
+                    dbname=from_database_name,
+                    tbl_name=from_table_name,
+                    new_tbl=tbl,
+                    environment_context=EnvironmentContext(properties={DO_NOT_UPDATE_STATS: DO_NOT_UPDATE_STATS_DEFAULT}),
+                )
+        except NoSuchObjectException as e:
+            raise NoSuchTableError(f"Table does not exist: {from_table_name}") from e
+        except InvalidOperationException as e:
+            raise NoSuchNamespaceError(f"Database does not exists: {to_database_name}") from e
+        return self.load_table(to_identifier)
+
+    @override
+    def create_namespace(self, namespace: str | Identifier, properties: Properties = EMPTY_DICT) -> None:
+        """Create a namespace in the catalog.
+
+        Args:
+            namespace: Namespace identifier.
+            properties: A string dictionary of properties for the given namespace.
+
+        Raises:
+            ValueError: If the identifier is invalid.
+            AlreadyExistsError: If a namespace with the given name already exists.
+        """
+        database_name = self.identifier_to_database(namespace)
+        hive_database = HiveDatabase(name=database_name, parameters=properties)
+
+        try:
+            with self._client as open_client:
+                open_client.create_database(_annotate_namespace(hive_database, properties))
+        except AlreadyExistsException as e:
+            raise NamespaceAlreadyExistsError(f"Database {database_name} already exists") from e
+
+    @override
+    def drop_namespace(self, namespace: str | Identifier) -> None:
+        """Drop a namespace.
+
+        Args:
+            namespace: Namespace identifier.
+
+        Raises:
+            NoSuchNamespaceError: If a namespace with the given name does not exist, or the identifier is invalid.
+            NamespaceNotEmptyError: If the namespace is not empty.
+        """
+        database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+        try:
+            with self._client as open_client:
+                open_client.drop_database(database_name, deleteData=False, cascade=False)
+        except InvalidOperationException as e:
+            raise NamespaceNotEmptyError(f"Database {database_name} is not empty") from e
+        except (MetaException, NoSuchObjectException) as e:
+            raise NoSuchNamespaceError(f"Database does not exists: {database_name}") from e
+
+    @override
+    def list_tables(self, namespace: str | Identifier) -> list[Identifier]:
+        """List Iceberg tables under the given namespace in the catalog.
+
+        When the database doesn't exist, it will just return an empty list.
+
+        Args:
+            namespace: Database to list.
+
+        Returns:
+            List[Identifier]: list of table identifiers.
+
+        Raises:
+            NoSuchNamespaceError: If a namespace with the given name does not exist, or the identifier is invalid.
+        """
+        database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+        with self._client as open_client:
+            return [
+                (database_name, table.tableName)
+                for table in self._fetch_hive_tables(open_client, database_name)
+                if table.parameters.get(TABLE_TYPE, "").lower() == ICEBERG
+            ]
+
+    @override
+    def list_namespaces(self, namespace: str | Identifier = ()) -> list[Identifier]:
+        """List namespaces from the given namespace. If not given, list top-level namespaces from the catalog.
+
+        Returns:
+            List[Identifier]: a List of namespace identifiers.
+        """
+        # Hierarchical namespace is not supported. Return an empty list
+        if namespace:
+            return []
+
+        with self._client as open_client:
+            return list(map(self.identifier_to_tuple, open_client.get_all_databases()))
+
+    @override
+    def load_namespace_properties(self, namespace: str | Identifier) -> Properties:
+        """Get properties for a namespace.
+
+        Args:
+            namespace: Namespace identifier.
+
+        Returns:
+            Properties: Properties for the given namespace.
+
+        Raises:
+            NoSuchNamespaceError: If a namespace with the given name does not exist, or identifier is invalid.
+        """
+        database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+        try:
+            with self._client as open_client:
+                database = open_client.get_database(name=database_name)
+                properties = database.parameters
+                properties[LOCATION] = database.locationUri
+                if comment := database.description:
+                    properties[COMMENT] = comment
+                return properties
+        except NoSuchObjectException as e:
+            raise NoSuchNamespaceError(f"Database does not exists: {database_name}") from e
+
+    @override
+    def update_namespace_properties(
+        self, namespace: str | Identifier, removals: set[str] | None = None, updates: Properties = EMPTY_DICT
+    ) -> PropertiesUpdateSummary:
+        """Remove provided property keys and update properties for a namespace.
+
+        Args:
+            namespace: Namespace identifier.
+            removals: Set of property keys that need to be removed. Optional Argument.
+            updates: Properties to be updated for the given namespace.
+
+        Raises:
+            NoSuchNamespaceError: If a namespace with the given name does not exist
+            ValueError: If removals and updates have overlapping keys.
+        """
+        self._check_for_overlap(updates=updates, removals=removals)
+        database_name = self.identifier_to_database(namespace, NoSuchNamespaceError)
+        with self._client as open_client:
+            try:
+                database = open_client.get_database(database_name)
+                parameters = database.parameters
+            except NoSuchObjectException as e:
+                raise NoSuchNamespaceError(f"Database does not exists: {database_name}") from e
+
+            removed: set[str] = set()
+            updated: set[str] = set()
+
+            if removals:
+                for key in removals:
+                    if key in parameters:
+                        parameters.pop(key)
+                        removed.add(key)
+            if updates:
+                for key, value in updates.items():
+                    parameters[key] = value
+                    updated.add(key)
+
+            open_client.alter_database(database_name, _annotate_namespace(database, parameters))
+
+        expected_to_change = (removals or set()).difference(removed)
+
+        return PropertiesUpdateSummary(removed=list(removed or []), updated=list(updated or []), missing=list(expected_to_change))
+
+    @override
+    def register_view(self, identifier: str | Identifier, metadata_location: str) -> View:
+        raise NotImplementedError
+
+    @override
+    def drop_view(self, identifier: str | Identifier) -> None:
+        raise NotImplementedError
+
+    def _get_default_warehouse_location(self, database_name: str, table_name: str) -> str:
+        """Override the default warehouse location to follow Hive-style conventions."""
+        return self._get_hive_style_warehouse_location(database_name, table_name)

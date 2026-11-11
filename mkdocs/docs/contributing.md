@@ -1,0 +1,354 @@
+---
+hide:
+  - navigation
+---
+
+<!--
+  - Licensed to the Apache Software Foundation (ASF) under one
+  - or more contributor license agreements.  See the NOTICE file
+  - distributed with this work for additional information
+  - regarding copyright ownership.  The ASF licenses this file
+  - to you under the Apache License, Version 2.0 (the
+  - "License"); you may not use this file except in compliance
+  - with the License.  You may obtain a copy of the License at
+  -
+  -   http://www.apache.org/licenses/LICENSE-2.0
+  -
+  - Unless required by applicable law or agreed to in writing,
+  - software distributed under the License is distributed on an
+  - "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  - KIND, either express or implied.  See the License for the
+  - specific language governing permissions and limitations
+  - under the License.
+  -->
+
+# Contributing
+
+We welcome contributions to Apache Iceberg! To learn more about contributing to Apache Iceberg, please refer to the [official Iceberg contribution guidelines](https://iceberg.apache.org/contribute/). These guidelines are intended as helpful suggestions to make the contribution process as seamless as possible, and are not strict rules.
+
+If you would like to discuss your proposed change before contributing, we encourage you to visit our [Community](https://iceberg.apache.org/community/) page. There, you will find various ways to connect with the community, including Slack and our mailing lists. Alternatively, you can open a [new issue](https://github.com/apache/iceberg-python/issues) directly in the GitHub repository.
+
+For first-time contributors, feel free to check out our [good first issues](https://github.com/apache/iceberg-python/issues/?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for an easy way to get started.
+
+## Contributing to PyIceberg
+
+The PyIceberg Project is hosted on GitHub at <https://github.com/apache/iceberg-python>.
+
+For development, [uv](https://docs.astral.sh/uv/) is used for dependency management and packaging. uv is a Python package installer and resolver, written in Rust, that serves as a drop-in replacement for pip, and virtualenv.
+
+### Getting Started
+
+Install uv and set up the development environment:
+
+```bash
+make install
+```
+
+This will install uv if needed, create a virtual environment in `.venv`, and install all dependencies.
+
+If you only want to just install uv:
+
+```bash
+make install-uv
+```
+
+### Python Version Selection
+
+You can specify which Python version to use when creating your virtual environment:
+
+```bash
+PYTHON=3.12 make install # Create environment with Python 3.12
+make test # Run tests against Python 3.12
+```
+
+> **Tip:** `uv python list` shows available interpreters. `uv python install 3.12` can install one if needed.
+
+### IDE Setup
+
+After running `make install`, configure your IDE to use the Python interpreter at `.venv/bin/python`.
+
+**To set up IDEA with uv:**
+
+- Open up the Python project in IntelliJ
+- Make sure that you're on latest main
+- Go to File -> Project Structure (⌘;)
+- Go to Platform Settings -> SDKs
+- Add Python SDK -> Virtualenv Environment -> Existing environment
+- Point to `.venv/bin/python`
+
+**VS Code:**
+
+- Press Cmd/Ctrl+Shift+P -> "Python: Select Interpreter"
+- Choose `.venv/bin/python`
+
+### Advanced uv Usage
+
+For full control over your environment, you can use uv commands directly. See the [uv documentation](https://docs.astral.sh/uv/) to learn more about:
+
+- Managing dependencies with `uv add` and `uv remove`
+- Python version management with `uv python`
+- Running commands with `uv run`
+- Lock file management with `uv lock`
+
+### Lock File Management
+
+`uv.lock` is a cross-platform lockfile that contains the exact versions of all project dependencies. See the [uv.lock documentation](https://docs.astral.sh/uv/guides/projects/#uvlock) for more details.
+
+**Automatic lock file management:**
+When you commit changes to `pyproject.toml` or dependencies, the [`uv-pre-commit`](https://github.com/astral-sh/uv-pre-commit) pre-commit hook will automatically update `uv.lock` if needed. If the lockfile changes, your commit will be stopped and you will be prompted to add the updated `uv.lock` to your commit.
+
+**Manual update:**
+If you want to update the lockfile yourself (for example, after editing `pyproject.toml`), run:
+
+```bash
+uv lock
+```
+
+**CI enforcement:**
+Our continuous integration (CI) system checks that `uv.lock` is up to date with `pyproject.toml` on every pull request or push. If they are out of sync, the CI build will fail. This ensures that dependencies are always consistent and up to date for all contributors.
+
+## Installation from source
+
+Clone the repository for local development:
+
+```sh
+git clone https://github.com/apache/iceberg-python.git
+cd iceberg-python
+pip3 install -e ".[s3fs,hive]"
+```
+
+Install it directly for GitHub (not recommended), but sometimes handy:
+
+```shell
+pip install "git+https://github.com/apache/iceberg-python.git#egg=pyiceberg[pyarrow]"
+```
+
+## Linting
+
+`prek` is used for autoformatting and linting:
+
+```bash
+make lint
+```
+
+`prek` will automatically fix the violations such as import orders, formatting etc. Pylint errors you need to fix yourself.
+
+In addition to manually running `make lint`, you can install the pre-commit hooks in your local repo with `prek install`. By doing this, linting is run automatically every time you make a commit.
+
+You can bump the integrations to the latest version using `prek auto-update`. This will check if there is a newer version of `{ruff,mypy,...}` and update the yaml.
+
+## Cleaning
+
+Removal of old cached files generated during the Cython build process:
+
+```bash
+make clean
+```
+
+Helps prevent build failures and unexpected behavior by removing outdated files, ensuring that only up-to-date sources are used & the build environment is always clean.
+
+## Testing
+
+For Python, `pytest` is used a testing framework in combination with `coverage` to enforce 90%+ code coverage.
+
+```bash
+make test
+```
+
+By default, S3 and ADLS tests are ignored because that require RustFS and azurite to be running.
+To run the S3 suite:
+
+```bash
+make test-s3
+```
+
+To run the ADLS suite:
+
+```bash
+make test-adls
+```
+
+To pass additional arguments to pytest, you can use `PYTEST_ARGS`.
+
+### Run pytest in verbose mode
+
+```sh
+make test PYTEST_ARGS="-v"
+```
+
+### Run pytest with pdb enabled
+
+```sh
+make test PYTEST_ARGS="--pdb"
+```
+
+To see all available pytest arguments, run `make test PYTEST_ARGS="--help"`.
+
+### Integration tests
+
+PyIceberg has integration tests with Apache Spark. Spark will create a new database and provision some tables that PyIceberg can query against.
+
+```sh
+make test-integration
+```
+
+This will restart the containers, to get to a clean state, and then run the PyTest suite. In case something changed in the Dockerfile or the provision script, you can run:
+
+```sh
+make test-integration-rebuild
+```
+
+To rebuild the containers from scratch.
+
+#### Running Integration Tests against REST Catalogs
+
+!!! warning "Do not run against production catalogs"
+    The integration tests will delete data throughout the entirety of your catalog. Running these integration tests against production catalogs will result in data loss.
+
+PyIceberg supports the ability to run our catalog tests against an arbitrary REST Catalog.
+
+In order to run the test catalog, you will need to specify which REST catalog to run against with the `PYICEBERG_TEST_CATALOG` environment variable
+
+```sh
+export PYICEBERG_TEST_CATALOG=test_catalog
+```
+
+The catalog in question can be configured either through the ~/.pyiceberg.yaml file or through environment variables.
+
+```yaml
+catalog:
+  test_catalog:
+    uri: http://rest-catalog/ws/
+    credential: t-1234:secret
+```
+
+```sh
+export PYICEBERG_CATALOG__TEST_CATALOG__URI=thrift://localhost:9083
+export PYICEBERG_CATALOG__TEST_CATALOG__ACCESS_KEY_ID=username
+export PYICEBERG_CATALOG__TEST_CATALOG__SECRET_ACCESS_KEY=password
+```
+
+## Notebooks for Experimentation
+
+PyIceberg provides Jupyter notebooks for quick experimentation and learning. Two Make commands are available depending on your needs:
+
+### PyIceberg Examples (`make notebook`)
+
+For basic PyIceberg experimentation without additional infrastructure:
+
+```bash
+make notebook
+```
+
+This will install notebook dependencies and launch Jupyter Lab in the `notebooks/` directory.
+
+**PyIceberg Example Notebook** (`notebooks/pyiceberg_example.ipynb`) is based on the [Getting Started with PyIceberg](https://py.iceberg.apache.org/#getting-started-with-pyiceberg) page. It demonstrates basic PyIceberg operations like creating catalogs, schemas, and querying tables without requiring any external services.
+
+### Spark Integration Examples (`make notebook-infra`)
+
+For working with PyIceberg alongside Spark, use the infrastructure-enabled notebook environment:
+
+```bash
+make notebook-infra
+```
+
+This command spins up the full integration test infrastructure via Docker Compose, including:
+
+- **Spark** (with Spark Connect)
+- **Iceberg REST Catalog** (using the [`apache/iceberg-rest-fixture`](https://hub.docker.com/r/apache/iceberg-rest-fixture) image)
+- **Hive Metastore**
+- **S3-compatible object storage** (RustFS)
+
+**Spark Example Notebook** (`notebooks/spark_integration_example.ipynb`) is based on the [Spark Getting Started](https://iceberg.apache.org/docs/nightly/spark-getting-started/) guide. This notebook demonstrates how to work with PyIceberg alongside Spark, leveraging the Docker-based testing setup for a complete local development environment.
+
+After running `make notebook-infra`, open `spark_integration_example.ipynb` in the Jupyter Lab interface to explore Spark integration capabilities.
+
+## Code standards
+
+Below are the formalized conventions that we adhere to in the PyIceberg project. The goal of this is to have a common agreement on how to evolve the codebase, but also using it as guidelines for newcomers to the project.
+
+### API Compatibility
+
+It is important to keep the Python public API compatible across versions. The Python official [PEP-8](https://peps.python.org/pep-0008/) defines public methods as: _Public attributes should have no leading underscores_. This means not removing any methods without any notice, or removing or renaming any existing parameters. Adding new optional parameters is okay.
+
+If you want to remove a method, please add a deprecation notice by annotating the function using `@deprecated`:
+
+```python
+from pyiceberg.utils.deprecated import deprecated
+
+
+@deprecated(
+    deprecated_in="0.1.0",
+    removed_in="0.2.0",
+    help_message="Please use load_something_else() instead",
+)
+def load_something():
+    pass
+```
+
+Which will warn:
+
+```text
+Call to load_something, deprecated in 0.1.0, will be removed in 0.2.0. Please use load_something_else() instead.
+```
+
+If you want to remove a property or notify about a behavior change, please add a deprecation notice by calling the deprecation_message function:
+
+```python
+from pyiceberg.utils.deprecated import deprecation_message
+
+deprecation_message(
+    deprecated_in="0.1.0",
+    removed_in="0.2.0",
+    help_message="The old_property is deprecated. Please use the something_else property instead.",
+)
+```
+
+Which will warn:
+
+```text
+Deprecated in 0.1.0, will be removed in 0.2.0. The old_property is deprecated. Please use the something_else property instead.
+```
+
+### Logging
+
+PyIceberg uses Python's standard logging module. You can control the logging level using either:
+
+**CLI option:**
+
+```bash
+pyiceberg --log-level DEBUG describe my_table
+```
+
+**Environment variable:**
+
+```bash
+export PYICEBERG_LOG_LEVEL=DEBUG
+pyiceberg describe my_table
+```
+
+Valid log levels are: `DEBUG`, `INFO`, `WARNING` (default), `ERROR`, `CRITICAL`.
+
+Debug logging is particularly useful for troubleshooting issues with FileIO implementations, catalog connections, and other integration points.
+
+### Type annotations
+
+For the type annotation the types from the `Typing` package are used.
+
+### Third party libraries
+
+PyIceberg naturally integrates into the rich Python ecosystem, however it is important to be hesitant adding third party packages. Adding a lot of packages makes the library heavyweight, and causes incompatibilities with other projects if they use a different version of the library. Also, big libraries such as `s3fs`, `adlfs`, `pyarrow`, `thrift` should be optional to avoid downloading everything, while not being sure if is actually being used.
+
+## Merging an urgent PR
+
+Committers can merge an urgent, approved pull request without waiting for the merge queue or required checks (for example, a security fix while CI is stuck). Use this only when necessary; otherwise, let the merge queue run.
+
+<!-- markdown-link-check-disable-next-line -->
+1. Join the [`apache/iceberg-public`](https://github.com/orgs/apache/teams/iceberg-public) team via [Boxer](https://gitbox.apache.org/boxer/) (one-time; membership syncs in about 15 minutes).
+2. Get the pull request approved by a committer.
+3. If the pull request is in the merge queue, click **Remove from queue**.
+4. Merge it directly:
+
+    ```sh
+    gh pr merge <number> --squash --admin
+    ```
