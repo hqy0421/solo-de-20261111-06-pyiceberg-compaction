@@ -1634,6 +1634,27 @@ def cleanup_old_snapshots(table_name: str, snapshot_ids: list[int]):
 cleanup_old_snapshots("analytics.user_events", [12345, 67890, 11111])
 ```
 
+### Data File Compaction
+
+Rewrite groups of small data files into larger files with `rewrite_data_files`. The rewrite is planned per partition (and partition spec), applies all applicable position deletes while reading, and replaces the selected input files in a single `replace` snapshot:
+
+```python
+# Compact every partition group containing at least five files
+results = table.maintenance.rewrite_data_files(min_input_files=5)
+
+# Compact only the files matching a predicate, using the configured target file size
+from pyiceberg.expressions import EqualTo
+results = table.maintenance.rewrite_data_files(
+    EqualTo("event_date", "2026-11-01"),
+    min_input_files=5,
+    target_file_size_bytes=256 * 1024 * 1024,
+)
+```
+
+Each returned `RewriteResult` describes one rewritten group: `rewritten_data_files` holds the input files and `data_files` holds the replacement files (empty when every input record was removed by deletes).
+
+Files written under historical partition specs keep their original spec. Files appended by another writer while the compaction runs are preserved; the commit only fails when one of the selected input files was concurrently deleted or received new delete files, in which case a `ValidationException` is raised instead of publishing stale output.
+
 ## Views
 
 If PyIceberg is unable to automatically determine view support on your REST Catalog, you can manually specify, `"view-endpoints-supported": "true"`:

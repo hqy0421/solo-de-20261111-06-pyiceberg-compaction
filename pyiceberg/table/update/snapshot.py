@@ -882,6 +882,190 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
             raise ValidationException(f"Missing required files to delete: {', '.join(sorted(missing))}")
 
 
+class _RewriteFiles(_OverwriteFiles):
+    """Replaces data files with rewritten versions without changing the table's data.
+
+    This produces a REPLACE snapshot, as used by data file compaction. The rewritten data
+    files already incorporate all applicable position deletes, so the deleted records stay
+    removed. Files are matched by their ``DataFile`` identity (file path) and the operation
+    only touches the explicitly selected files: any file appended concurrently, in the same
+    or another partition, is carried over untouched.
+
+    Unlike a regular overwrite, replacement files may use any partition spec of the table.
+    The added entries are therefore grouped by spec id instead of being written against the
+    default spec, so tables that carry files written under historical partition specs can be
+    compacted while those specs remain in use.
+    """
+
+    def __init__(
+        self,
+        transaction: Transaction,
+        io: FileIO,
+        branch: str | None = MAIN_BRANCH,
+        commit_uuid: uuid.UUID | None = None,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+    ) -> None:
+        super().__init__(
+            operation=Operation.REPLACE,
+            transaction=transaction,
+            io=io,
+            commit_uuid=commit_uuid,
+            branch=branch,
+            snapshot_properties=snapshot_properties,
+        )
+        # A rewrite only conflicts when one of its own input files changes (see _validate_concurrency).
+        # The snapshot-level write.update isolation level must not turn unrelated concurrent appends
+        # into conflicts, so rewrites always validate at snapshot isolation.
+        self._isolation_operation = Operation.REPLACE
+
+    def _summary(self, snapshot_properties: dict[str, str] = EMPTY_DICT) -> Summary:
+        # The base implementation assumes every added file uses the current default spec. Rewritten
+        # files can keep historical specs, so resolve the partition spec per file instead.
+        from pyiceberg.table import TableProperties
+
+        table_metadata = self._transaction.table_metadata
+        schema = table_metadata.schema()
+        partition_summary_limit = int(
+            table_metadata.properties.get(
+                TableProperties.WRITE_PARTITION_SUMMARY_LIMIT, TableProperties.WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT
+            )
+        )
+        ssc = SnapshotSummaryCollector(partition_summary_limit=partition_summary_limit)
+
+        for data_file in self._added_data_files:
+            ssc.add_file(
+                data_file=data_file,
+                partition_spec=table_metadata.specs()[data_file.spec_id],
+                schema=schema,
+            )
+
+        if self._deleted_data_files:
+            specs = table_metadata.specs()
+            for data_file in self._deleted_data_files:
+                ssc.remove_file(
+                    data_file=data_file,
+                    partition_spec=specs[data_file.spec_id],
+                    schema=schema,
+                )
+
+        previous_snapshot = (
+            table_metadata.snapshot_by_id(self._parent_snapshot_id) if self._parent_snapshot_id is not None else None
+        )
+
+        return update_snapshot_summaries(
+            summary=Summary(operation=self._operation, **ssc.build(), **snapshot_properties),
+            previous_summary=previous_snapshot.summary if previous_snapshot is not None else None,
+        )
+
+    def _manifests(self) -> list[ManifestFile]:
+        # The base implementation writes every added entry against the current default spec.
+        # Rewritten files can belong to historical specs, so write the added entries grouped
+        # by spec id and reuse the overwrite logic for deleted and untouched entries.
+        added_entries_by_spec: dict[int, list[DataFile]] = defaultdict(list)
+        for data_file in self._added_data_files:
+            added_entries_by_spec[data_file.spec_id].append(data_file)
+
+        added_manifests: list[ManifestFile] = []
+        for spec_id, data_files in added_entries_by_spec.items():
+            with self.new_manifest_writer(spec=self.spec(spec_id)) as writer:
+                for data_file in data_files:
+                    writer.add(
+                        ManifestEntry.from_args(
+                            status=ManifestEntryStatus.ADDED,
+                            snapshot_id=self._snapshot_id,
+                            sequence_number=None,
+                            file_sequence_number=None,
+                            data_file=data_file,
+                        )
+                    )
+            added_manifests.append(writer.to_manifest_file())
+
+        self._build_delete_files_partition_predicate()
+        deleted_entries = self._deleted_entries()
+
+        executor = ExecutorFactory.get_or_create()
+        delete_manifests = executor.submit(
+            lambda: self._write_rewrite_deleted_manifests(deleted_entries) if deleted_entries else []
+        )
+        existing_manifests = executor.submit(self._existing_manifests)
+
+        return added_manifests + delete_manifests.result() + existing_manifests.result()
+
+    def _write_rewrite_deleted_manifests(self, deleted_entries: list[ManifestEntry]) -> list[ManifestFile]:
+        deleted_manifests = []
+        partition_groups: dict[int, list[ManifestEntry]] = defaultdict(list)
+        for deleted_entry in deleted_entries:
+            partition_groups[deleted_entry.data_file.spec_id].append(deleted_entry)
+        for spec_id, entries in partition_groups.items():
+            with self.new_manifest_writer(self.spec(spec_id)) as writer:
+                for entry in entries:
+                    writer.add_entry(entry)
+            deleted_manifests.append(writer.to_manifest_file())
+        return deleted_manifests
+
+    def _validate_concurrency(self) -> None:
+        """Validate that the files selected for rewriting are unchanged in concurrent commits.
+
+        A rewrite is scoped to an explicit set of input files, so it conflicts only when a
+        concurrent commit deletes one of them or adds a delete file applying to them. Both
+        conditions would mean the locally rewritten output is stale: committing it would
+        either reference a removed file or resurrect records deleted after the rewrite was
+        planned. Concurrent appends, including appends into the compacted partitions, never
+        conflict and are preserved by carrying their entries over as existing files.
+        """
+        from pyiceberg.manifest import ManifestContent
+        from pyiceberg.table.snapshots import Operation
+        from pyiceberg.table.update.validate import (
+            _validate_data_files_exist,
+            _validate_no_new_deletes_for_data_files,
+        )
+
+        if self._commit_window is None or self._commit_window.is_empty() or not self._deleted_data_files:
+            return
+
+        catalog_head = self._commit_window.head
+        if catalog_head is None:
+            return
+
+        table = self._transaction._table
+        starting_snapshot = self._commit_window.base
+
+        _validate_data_files_exist(table, catalog_head, self._deleted_data_files, starting_snapshot)
+        # A delete file committed by any concurrent operation, including a plain append, applies to
+        # the rewritten input files. Scan every operation's manifests so the rewrite fails instead
+        # of publishing output that resurrects concurrently deleted records. Both manifest contents
+        # are checked: the spec uses delete manifests, while writers without that path (including
+        # this library's current append path) place delete files in data manifests.
+        _validate_no_new_deletes_for_data_files(
+            table,
+            catalog_head,
+            self._build_rewrite_conflict_filter(),
+            self._deleted_data_files,
+            starting_snapshot,
+            matching_operations=set(Operation),
+            manifest_contents=(ManifestContent.DELETES, ManifestContent.DATA),
+        )
+
+    def _build_rewrite_conflict_filter(self) -> BooleanExpression | None:
+        """Partition predicate covering every input file, used to scope the new-delete check."""
+        partition_records_by_spec: dict[int, set[Record]] = defaultdict(set)
+        for data_file in self._deleted_data_files:
+            partition_records_by_spec[data_file.spec_id].add(data_file.partition)
+
+        expressions: list[BooleanExpression] = []
+        for spec_id, partition_records in partition_records_by_spec.items():
+            predicate = self._transaction._build_partition_predicate(
+                partition_records=partition_records,
+                partition_fields=[field.name for field in self.spec(spec_id).fields],
+            )
+            if predicate != AlwaysFalse():
+                expressions.append(predicate)
+
+        if not expressions:
+            return None
+        return Or(*expressions) if len(expressions) > 1 else expressions[0]
+
+
 class UpdateSnapshot:
     _transaction: Transaction
     _io: FileIO
@@ -936,6 +1120,15 @@ class UpdateSnapshot:
             transaction=self._transaction,
             io=self._io,
             branch=self._branch,
+            snapshot_properties=self._snapshot_properties,
+        )
+
+    def rewrite_files(self, commit_uuid: uuid.UUID | None = None) -> _RewriteFiles:
+        return _RewriteFiles(
+            transaction=self._transaction,
+            io=self._io,
+            branch=self._branch,
+            commit_uuid=commit_uuid,
             snapshot_properties=self._snapshot_properties,
         )
 

@@ -23,6 +23,7 @@ from pyiceberg.expressions.visitors import ROWS_CANNOT_MATCH, _InclusiveMetricsE
 from pyiceberg.manifest import (
     INITIAL_SEQUENCE_NUMBER,
     DataFile,
+    DataFileContent,
     ManifestContent,
     ManifestEntry,
     ManifestEntryStatus,
@@ -36,7 +37,7 @@ from pyiceberg.typedef import Record
 
 VALIDATE_DATA_FILES_EXIST_OPERATIONS: set[Operation] = {Operation.OVERWRITE, Operation.REPLACE, Operation.DELETE}
 VALIDATE_ADDED_DATA_FILES_OPERATIONS: set[Operation] = {Operation.APPEND, Operation.OVERWRITE}
-VALIDATE_ADDED_DELETE_FILES_OPERATIONS: set[Operation] = {Operation.DELETE, Operation.OVERWRITE}
+VALIDATE_ADDED_DELETE_FILES_OPERATIONS: set[Operation] = {Operation.DELETE, Operation.OVERWRITE, Operation.REPLACE}
 
 
 def _validation_history(
@@ -262,6 +263,8 @@ def _added_delete_files(
     data_filter: BooleanExpression | None,
     partition_set: dict[int, set[Record]] | None,
     parent_snapshot: Snapshot | None,
+    matching_operations: set[Operation] | None = None,
+    manifest_content: ManifestContent = ManifestContent.DELETES,
 ) -> DeleteFileIndex:
     """Return matching delete files that have been added to the table since a starting snapshot.
 
@@ -271,6 +274,13 @@ def _added_delete_files(
         data_filter: Optional filter to match data files
         partition_set: Optional set of partitions to match data files
         parent_snapshot: Parent snapshot to get the history from
+        matching_operations: Snapshot operations whose delete manifests are scanned. Defaults to
+            the operations that can conflict with overwrite/delete planning. Rewrites pass all
+            operations because a delete file committed by a concurrent append still applies to
+            their input files and must fail the commit.
+        manifest_content: Manifest content to scan. The spec stores delete files in delete
+            manifests, but writers that have not grown a delete-manifest path yet place them in
+            data manifests, so rewrite validation scans both.
 
     Returns:
         DeleteFileIndex
@@ -279,13 +289,19 @@ def _added_delete_files(
         return DeleteFileIndex()
 
     manifests, snapshot_ids = _validation_history(
-        table, parent_snapshot, starting_snapshot, VALIDATE_ADDED_DELETE_FILES_OPERATIONS, ManifestContent.DELETES
+        table,
+        parent_snapshot,
+        starting_snapshot,
+        matching_operations or VALIDATE_ADDED_DELETE_FILES_OPERATIONS,
+        manifest_content,
     )
 
     dfi = DeleteFileIndex()
 
     for manifest in manifests:
         for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=True):
+            if entry.data_file is None or entry.data_file.content == DataFileContent.DATA:
+                continue
             if _filter_manifest_entries(
                 entry, snapshot_ids, data_filter, partition_set, ManifestEntryStatus.ADDED, table.schema()
             ):
@@ -364,6 +380,8 @@ def _validate_no_new_deletes_for_data_files(
     data_filter: BooleanExpression | None,
     data_files: set[DataFile],
     parent_snapshot: Snapshot | None,
+    matching_operations: set[Operation] | None = None,
+    manifest_contents: tuple[ManifestContent, ...] = (ManifestContent.DELETES,),
 ) -> None:
     """Validate no new delete files must be applied for data files that have been added to the table since a starting snapshot.
 
@@ -373,16 +391,30 @@ def _validate_no_new_deletes_for_data_files(
         data_filter: Expression used to find added data files
         data_files: data files to validate have no new deletes
         parent_snapshot: Ending snapshot on the branch being validated
+        matching_operations: Snapshot operations whose delete manifests are scanned. Defaults to
+            the operations that can conflict with overwrite/delete planning.
+        manifest_contents: Manifest contents to scan for delete file entries. Rewrites also scan
+            data manifests because writers without a delete-manifest path place delete files there.
     """
     # If there is no current state, or no files has been added
     if table.format_version < 2:
         return
 
-    deletes = _added_delete_files(table, starting_snapshot, data_filter, None, parent_snapshot)
     seq_num = _starting_sequence_number(table, starting_snapshot)
 
-    # Fail to any delete file found that applies to files written in or before the starting snapshot
-    for data_file in data_files:
-        delete_files = deletes.for_data_file(seq_num, data_file, data_file.partition)
-        if len(delete_files) > 0:
-            raise ValidationException(f"Cannot commit, found new delete for replace data file {data_file}")
+    for manifest_content in manifest_contents:
+        deletes = _added_delete_files(
+            table,
+            starting_snapshot,
+            data_filter,
+            None,
+            parent_snapshot,
+            matching_operations=matching_operations,
+            manifest_content=manifest_content,
+        )
+
+        # Fail to any delete file found that applies to files written in or before the starting snapshot
+        for data_file in data_files:
+            delete_files = deletes.for_data_file(seq_num, data_file, data_file.partition)
+            if len(delete_files) > 0:
+                raise ValidationException(f"Cannot commit, found new delete for replace data file {data_file}")
