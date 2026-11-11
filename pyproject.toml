@@ -104,7 +104,7 @@ encryption = ["cryptography>=42.0.0"]
 
 [dependency-groups]
 dev = [
-    "pytest==9.1.1",
+    "pytest==9.2.0",
     "pytest-checkdocs==2.14.0",
     "setuptools>=83.0.0",
     "prek>=0.2.1",
